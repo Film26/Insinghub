@@ -1,7 +1,4 @@
 // js/dashboard.js
-// App shell: navigation, data loading (API / file import / sample data), the
-// shared row-reading helpers that js/insighthub.js depends on, and the
-// Dashboard Overview view itself.
 
 window.AppData = {
   rawData: [],
@@ -9,10 +6,6 @@ window.AppData = {
   currentView: "dashboard",
   overviewSearchTerm: "",
 };
-
-// ---------------------------------------------------------------------------
-// Shared row helpers (consumed by js/insighthub.js via window.*)
-// ---------------------------------------------------------------------------
 
 const __rowKeyCache = new WeakMap();
 
@@ -226,8 +219,86 @@ function getSampleData() {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard Overview view
+// Dashboard: Team Report + Individual Admin report (role-scoped)
 // ---------------------------------------------------------------------------
+
+const REVENUE_KEYS = ["ยอดขาย", "ราคาสินค้ายังไม่รวมภาษี", "Net Sales", "Revenue", "Amount", "ยอดโอน"];
+const DATE_KEYS = ["วันที่สร้าง", "วันที่โอนเงิน", "OrderDate", "Date", "วันที่"];
+const NAME_KEYS = ["CustomerName", "ชื่อผู้ส่ง", "Customer ID", "รหัสลูกค้า"];
+const PHONE_KEYS = ["Phone", "เบอร์โทร", "เบอร์โทรศัพท์"];
+
+function fmtMoney(n) {
+  return "฿" + Math.round(n || 0).toLocaleString();
+}
+
+function getRowRevenue(row) {
+  const revStr = window.getRowValue(row, REVENUE_KEYS) || "0";
+  const rev = parseFloat(revStr.toString().replace(/,/g, ""));
+  return isNaN(rev) ? 0 : rev;
+}
+
+function getRowDateTime(row) {
+  const parsed = window.parseDate(window.getRowValue(row, DATE_KEYS));
+  return parsed ? new Date(parsed.y, parsed.m - 1, parsed.d).getTime() : 0;
+}
+
+function getCustomerKeyLite(row) {
+  const phone = window.getRowValue(row, PHONE_KEYS);
+  const name = window.getRowValue(row, NAME_KEYS);
+  return (phone || name || "").toString().trim().toLowerCase();
+}
+
+// Buckets the raw channel value into the 3 groups referenced in the Team
+// Report (matches window.standardizeChannel()'s main channels, defined in
+// js/insighthub.js, once that script has loaded).
+const CHANNEL_GROUP_MAP = {
+  Facebook: "Online",
+  Instagram: "Online",
+  Line: "Online",
+  Website: "Online",
+  Email: "Online",
+  CRM: "Online",
+  Telesale: "Online",
+  Call: "Online",
+  Lazada: "Marketplace",
+  Shopee: "Marketplace",
+  Tiktok: "Marketplace",
+  PC: "Offline/Other",
+  Other: "Offline/Other",
+};
+function getChannelGroup(row) {
+  const raw = window.getRowValue(row, ["ช่องทาง", "Channel"]);
+  if (!raw) return "Offline/Other";
+  if (typeof window.standardizeChannel === "function") {
+    const std = window.standardizeChannel(raw);
+    return CHANNEL_GROUP_MAP[std.mainChannel] || "Offline/Other";
+  }
+  return "Offline/Other";
+}
+
+// Per-admin (ชื่อแอดมิน) aggregation used by both the Team Report's
+// performance table and the Individual Admin report.
+function buildAdminStats(rows) {
+  const map = {};
+  rows.forEach((r) => {
+    if (!window.isSaleOrder(r)) return;
+    const admin = window.getNormalizedAdmin(r);
+    if (!map[admin]) map[admin] = { admin, orders: 0, revenue: 0, customers: new Set() };
+    map[admin].orders += 1;
+    map[admin].revenue += getRowRevenue(r);
+    const key = getCustomerKeyLite(r);
+    if (key) map[admin].customers.add(key);
+  });
+  return Object.values(map)
+    .map((a) => ({
+      admin: a.admin,
+      orders: a.orders,
+      revenue: a.revenue,
+      customers: a.customers.size,
+      aov: a.orders > 0 ? a.revenue / a.orders : 0,
+    }))
+    .sort((a, b) => b.revenue - a.revenue);
+}
 
 function emptyStateHtml(message) {
   return `
@@ -246,90 +317,24 @@ function emptyStateHtml(message) {
   `;
 }
 
-function renderDashboardOverview(filteredData, rawData) {
-  const container = document.getElementById("view-dashboard");
-  if (!container) return;
-
-  if (!rawData || rawData.length === 0) {
-    container.innerHTML = emptyStateHtml("ยังไม่มีข้อมูล กรุณา Import ไฟล์ หรือกดโหลดข้อมูลตัวอย่าง");
-    return;
-  }
-
-  const saleRows = rawData.filter((r) => window.isSaleOrder(r));
-  let totalRevenue = 0;
-  const customerSet = new Set();
-
-  saleRows.forEach((r) => {
-    const revStr =
-      window.getRowValue(r, ["ยอดขาย", "ราคาสินค้ายังไม่รวมภาษี", "Net Sales", "Revenue", "Amount", "ยอดโอน"]) || "0";
-    const rev = parseFloat(revStr.toString().replace(/,/g, ""));
-    if (!isNaN(rev)) totalRevenue += rev;
-
-    const phone = window.getRowValue(r, ["Phone", "เบอร์โทร", "เบอร์โทรศัพท์"]);
-    const name = window.getRowValue(r, ["CustomerName", "ชื่อผู้ส่ง", "Customer ID", "รหัสลูกค้า"]);
-    const key = (phone || name || "").toString().trim().toLowerCase();
-    if (key) customerSet.add(key);
-  });
-
-  const totalOrders = saleRows.length;
-  const aov = totalOrders > 0 ? totalRevenue / totalOrders : 0;
-
+function buildRecentOrdersTable(rows, limit) {
   const term = (window.AppData.overviewSearchTerm || "").toLowerCase();
-  let recentRows = saleRows.slice();
+  let filtered = rows;
   if (term) {
-    recentRows = recentRows.filter((r) => {
-      const name = (window.getRowValue(r, ["CustomerName", "ชื่อผู้ส่ง", "Customer ID", "รหัสลูกค้า"]) || "")
-        .toString()
-        .toLowerCase();
-      const phone = (window.getRowValue(r, ["Phone", "เบอร์โทร", "เบอร์โทรศัพท์"]) || "").toString();
+    filtered = rows.filter((r) => {
+      const name = (window.getRowValue(r, NAME_KEYS) || "").toString().toLowerCase();
+      const phone = (window.getRowValue(r, PHONE_KEYS) || "").toString();
       return name.includes(term) || phone.includes(term);
     });
   }
+  const sorted = filtered.slice().sort((a, b) => getRowDateTime(b) - getRowDateTime(a));
+  const top = sorted.slice(0, limit);
 
-  recentRows.sort((a, b) => {
-    const da = window.parseDate(window.getRowValue(a, ["วันที่สร้าง", "วันที่โอนเงิน", "OrderDate", "Date", "วันที่"]));
-    const db = window.parseDate(window.getRowValue(b, ["วันที่สร้าง", "วันที่โอนเงิน", "OrderDate", "Date", "วันที่"]));
-    const ta = da ? new Date(da.y, da.m - 1, da.d).getTime() : 0;
-    const tb = db ? new Date(db.y, db.m - 1, db.d).getTime() : 0;
-    return tb - ta;
-  });
-  const recentTop = recentRows.slice(0, 10);
-
-  const fmtMoney = (n) => "฿" + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
-
-  const kpiHtml = `
-    <div class="overview-kpi-grid">
-      <div class="overview-kpi-card">
-        <div class="icon"><i class="fas fa-users"></i></div>
-        <div class="lbl">Total Customers</div>
-        <div class="val">${customerSet.size.toLocaleString()}</div>
-      </div>
-      <div class="overview-kpi-card">
-        <div class="icon"><i class="fas fa-receipt"></i></div>
-        <div class="lbl">Total Orders</div>
-        <div class="val">${totalOrders.toLocaleString()}</div>
-      </div>
-      <div class="overview-kpi-card">
-        <div class="icon"><i class="fas fa-sack-dollar"></i></div>
-        <div class="lbl">Total Revenue</div>
-        <div class="val">${fmtMoney(totalRevenue)}</div>
-      </div>
-      <div class="overview-kpi-card">
-        <div class="icon"><i class="fas fa-scale-balanced"></i></div>
-        <div class="lbl">Avg. Order Value</div>
-        <div class="val">${fmtMoney(aov)}</div>
-      </div>
-    </div>
-  `;
-
-  const rowsHtml = recentTop
+  const rowsHtml = top
     .map((r) => {
-      const date = window.getRowValue(r, ["วันที่สร้าง", "วันที่โอนเงิน", "OrderDate", "Date", "วันที่"]) || "-";
-      const name = window.getRowValue(r, ["CustomerName", "ชื่อผู้ส่ง", "Customer ID", "รหัสลูกค้า"]) || "-";
+      const date = window.getRowValue(r, DATE_KEYS) || "-";
+      const name = window.getRowValue(r, NAME_KEYS) || "-";
       const product = window.getRowValue(r, ["Product Set", "ชื่อสินค้า", "Product", "รายการขาย"]) || "-";
-      const revStr =
-        window.getRowValue(r, ["ยอดขาย", "ราคาสินค้ายังไม่รวมภาษี", "Net Sales", "Revenue", "Amount", "ยอดโอน"]) || "0";
-      const rev = parseFloat(revStr.toString().replace(/,/g, "")) || 0;
       const channel = window.getRowValue(r, ["ช่องทาง", "Channel"]) || "-";
       const admin = window.getNormalizedAdmin(r);
       return `
@@ -337,7 +342,7 @@ function renderDashboardOverview(filteredData, rawData) {
           <td>${date}</td>
           <td>${name}</td>
           <td>${product}</td>
-          <td style="text-align:right; font-weight:600;">${fmtMoney(rev)}</td>
+          <td style="text-align:right; font-weight:600;">${fmtMoney(getRowRevenue(r))}</td>
           <td>${channel}</td>
           <td>${admin === "Unknown" ? "-" : admin}</td>
         </tr>
@@ -345,27 +350,214 @@ function renderDashboardOverview(filteredData, rawData) {
     })
     .join("");
 
+  return `
+    <table class="overview-table">
+      <thead>
+        <tr>
+          <th>Date</th><th>Customer</th><th>Product</th>
+          <th style="text-align:right;">Revenue</th><th>Channel</th><th>Admin</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rowsHtml || '<tr><td colspan="6" style="text-align:center; color:#999; padding:20px;">ไม่พบรายการที่ตรงกับคำค้นหา</td></tr>'}
+      </tbody>
+    </table>
+  `;
+}
+
+function renderTeamReport(container, rawData, session) {
+  const saleRows = rawData.filter((r) => window.isSaleOrder(r));
+  const totalRevenue = saleRows.reduce((sum, r) => sum + getRowRevenue(r), 0);
+  const customerSet = new Set(saleRows.map(getCustomerKeyLite).filter(Boolean));
+  const totalOrders = saleRows.length;
+  const aov = totalOrders > 0 ? totalRevenue / totalOrders : 0;
+
+  const channelTotals = { Online: 0, Marketplace: 0, "Offline/Other": 0 };
+  saleRows.forEach((r) => {
+    channelTotals[getChannelGroup(r)] += getRowRevenue(r);
+  });
+  const maxChannelRevenue = Math.max(1, ...Object.values(channelTotals));
+
+  const adminStats = buildAdminStats(rawData);
+
+  const confidentialHtml =
+    session.role === window.CrmRoles.ROLES.SUPER_ADMIN
+      ? `
+    <div class="overview-section confidential-card">
+      <h3><i class="fas fa-lock"></i> ข้อมูลระดับความลับ (Super Admin เท่านั้น)</h3>
+      <p class="confidential-placeholder">
+        ยังไม่มีคอลัมน์ต้นทุน (เช่น "ต้นทุน"/"Cost") ในชีต Orders และยังไม่มีการบันทึกงบประมาณการตลาดไว้ในระบบ —
+        เพิ่มคอลัมน์เหล่านี้ในชีต Orders (หรือแจ้งให้เพิ่มฟีเจอร์บันทึกงบประมาณ) เพื่อให้ Super Admin
+        เห็นต้นทุน/กำไรสุทธิ และงบประมาณการตลาดภาพรวมที่นี่
+      </p>
+    </div>
+  `
+      : "";
+
   container.innerHTML = `
-    ${kpiHtml}
+    <div class="overview-kpi-grid">
+      <div class="overview-kpi-card"><div class="icon"><i class="fas fa-users"></i></div><div class="lbl">Total Customers</div><div class="val">${customerSet.size.toLocaleString()}</div></div>
+      <div class="overview-kpi-card"><div class="icon"><i class="fas fa-receipt"></i></div><div class="lbl">Total Orders</div><div class="val">${totalOrders.toLocaleString()}</div></div>
+      <div class="overview-kpi-card"><div class="icon"><i class="fas fa-sack-dollar"></i></div><div class="lbl">Total Revenue</div><div class="val">${fmtMoney(totalRevenue)}</div></div>
+      <div class="overview-kpi-card"><div class="icon"><i class="fas fa-scale-balanced"></i></div><div class="lbl">Avg. Order Value</div><div class="val">${fmtMoney(aov)}</div></div>
+    </div>
+
     <div class="overview-section">
-      <h3>Recent Orders${term ? ` (ค้นหา: "${term}")` : ""}</h3>
+      <h3>ยอดขายแยกตามช่องทาง (Online / Marketplace / Offline)</h3>
+      ${Object.keys(channelTotals)
+        .map(
+          (group) => `
+        <div class="channel-bar-row">
+          <div class="channel-bar-label">${group}</div>
+          <div class="channel-bar-track"><div class="channel-bar-fill" style="width:${(channelTotals[group] / maxChannelRevenue) * 100}%"></div></div>
+          <div class="channel-bar-value">${fmtMoney(channelTotals[group])}</div>
+        </div>
+      `
+        )
+        .join("")}
+    </div>
+
+    <div class="overview-section">
+      <h3>ผลงานทีมแยกรายแอดมิน</h3>
       <table class="overview-table">
         <thead>
-          <tr>
-            <th>Date</th>
-            <th>Customer</th>
-            <th>Product</th>
-            <th style="text-align:right;">Revenue</th>
-            <th>Channel</th>
-            <th>Admin</th>
-          </tr>
+          <tr><th>Admin</th><th style="text-align:right;">Orders</th><th style="text-align:right;">Revenue</th><th style="text-align:right;">AOV</th><th style="text-align:right;">Customers</th></tr>
         </thead>
         <tbody>
-          ${rowsHtml || '<tr><td colspan="6" style="text-align:center; color:#999; padding:20px;">ไม่พบรายการที่ตรงกับคำค้นหา</td></tr>'}
+          ${adminStats
+            .map(
+              (a) => `
+            <tr>
+              <td style="font-weight:600;">${a.admin === "Unknown" ? "-" : a.admin}</td>
+              <td style="text-align:right;">${a.orders.toLocaleString()}</td>
+              <td style="text-align:right; font-weight:600;">${fmtMoney(a.revenue)}</td>
+              <td style="text-align:right;">${fmtMoney(a.aov)}</td>
+              <td style="text-align:right;">${a.customers.toLocaleString()}</td>
+            </tr>
+          `
+            )
+            .join("")}
         </tbody>
       </table>
     </div>
+
+    ${confidentialHtml}
+
+    <div class="overview-section">
+      <h3>Recent Orders${window.AppData.overviewSearchTerm ? ` (ค้นหา: "${window.AppData.overviewSearchTerm}")` : ""}</h3>
+      ${buildRecentOrdersTable(saleRows, 10)}
+    </div>
   `;
+}
+
+function renderIndividualAdminReport(container, rawData, session) {
+  const adminStats = buildAdminStats(rawData);
+  const isLocked = session.role === window.CrmRoles.ROLES.SALES_ADMIN;
+
+  if (isLocked && !session.adminName) {
+    container.innerHTML = `
+      <div class="locked-note">
+        <i class="fas fa-triangle-exclamation"></i>
+        บัญชีนี้ยังไม่ได้ผูก AdminName กับข้อมูลออเดอร์ — กรุณาแจ้ง Super Admin ให้ตั้งค่า AdminName
+        ในหน้า Settings &gt; จัดการผู้ใช้งาน ให้ตรงกับคอลัมน์ "ชื่อแอดมิน" ในชีต Orders
+      </div>
+    `;
+    return;
+  }
+
+  const options = isLocked ? [session.adminName] : adminStats.map((a) => a.admin);
+  if (!isLocked && options.length === 0) {
+    container.innerHTML = emptyStateHtml("ยังไม่มีข้อมูลออเดอร์ให้แสดงรายงานรายบุคคล");
+    return;
+  }
+
+  let selected = window.AppData.selectedAdminFilter;
+  if (isLocked) selected = session.adminName;
+  if (!selected || !options.includes(selected)) selected = options[0];
+  window.AppData.selectedAdminFilter = selected;
+
+  const stat = adminStats.find((a) => a.admin === selected) || { orders: 0, revenue: 0, aov: 0, customers: 0 };
+  const adminRows = rawData.filter((r) => window.isSaleOrder(r) && window.getNormalizedAdmin(r) === selected);
+
+  container.innerHTML = `
+    <div class="admin-picker-row">
+      <label for="admin-report-picker">เลือกแอดมิน:</label>
+      <select id="admin-report-picker" ${isLocked ? "disabled" : ""}>
+        ${options.map((o) => `<option value="${o}" ${o === selected ? "selected" : ""}>${o === "Unknown" ? "(ไม่ระบุ)" : o}</option>`).join("")}
+      </select>
+      ${isLocked ? '<span class="text-muted" style="font-size:12px;"><i class="fas fa-lock"></i> ล็อกเฉพาะบัญชีของคุณ</span>' : ""}
+    </div>
+
+    <div class="overview-kpi-grid">
+      <div class="overview-kpi-card"><div class="icon"><i class="fas fa-receipt"></i></div><div class="lbl">Orders Handled</div><div class="val">${stat.orders.toLocaleString()}</div></div>
+      <div class="overview-kpi-card"><div class="icon"><i class="fas fa-sack-dollar"></i></div><div class="lbl">Revenue</div><div class="val">${fmtMoney(stat.revenue)}</div></div>
+      <div class="overview-kpi-card"><div class="icon"><i class="fas fa-scale-balanced"></i></div><div class="lbl">Avg. Order Value</div><div class="val">${fmtMoney(stat.aov)}</div></div>
+      <div class="overview-kpi-card"><div class="icon"><i class="fas fa-users"></i></div><div class="lbl">Customers Handled</div><div class="val">${stat.customers.toLocaleString()}</div></div>
+    </div>
+
+    <div class="overview-section">
+      <h3>ออเดอร์ล่าสุดของ ${selected === "Unknown" ? "(ไม่ระบุ)" : selected}${window.AppData.overviewSearchTerm ? ` (ค้นหา: "${window.AppData.overviewSearchTerm}")` : ""}</h3>
+      ${buildRecentOrdersTable(adminRows, 15)}
+    </div>
+  `;
+
+  if (!isLocked) {
+    document.getElementById("admin-report-picker").addEventListener("change", (e) => {
+      window.AppData.selectedAdminFilter = e.target.value;
+      window.applyFilters();
+    });
+  }
+}
+
+function renderDashboardOverview(filteredData, rawData) {
+  const container = document.getElementById("view-dashboard");
+  if (!container) return;
+
+  const session = (window.CrmAuth && window.CrmAuth.getSession()) || { role: window.CrmRoles.ROLES.SALES_ADMIN };
+  const ROLES = window.CrmRoles.ROLES;
+
+  if (!rawData || rawData.length === 0) {
+    container.innerHTML = emptyStateHtml("ยังไม่มีข้อมูล กรุณา Import ไฟล์ หรือกดโหลดข้อมูลตัวอย่าง");
+    return;
+  }
+
+  // Sales Admin only ever sees their own individual report — Team Report
+  // (channel splits, team-wide admin comparison) is manager/super_admin only.
+  const canSeeTeamReport = session.role !== ROLES.SALES_ADMIN;
+  if (!canSeeTeamReport) window.AppData.dashboardTab = "individual";
+  if (!window.AppData.dashboardTab) window.AppData.dashboardTab = "team";
+
+  const tabsHtml = `
+    <div class="dash-subtabs">
+      <button class="dash-subtab-btn ${window.AppData.dashboardTab === "team" ? "active" : ""}"
+              id="dash-tab-team" ${canSeeTeamReport ? "" : "disabled title=\"Sales Admin ไม่มีสิทธิ์ดูรายงานทีม\""}>
+        <i class="fas fa-people-group"></i> รายงานทีม
+      </button>
+      <button class="dash-subtab-btn ${window.AppData.dashboardTab === "individual" ? "active" : ""}" id="dash-tab-individual">
+        <i class="fas fa-user"></i> แอดมินรายบุคคล
+      </button>
+    </div>
+    <div id="dash-report-body"></div>
+  `;
+  container.innerHTML = tabsHtml;
+
+  const body = document.getElementById("dash-report-body");
+  if (window.AppData.dashboardTab === "team" && canSeeTeamReport) {
+    renderTeamReport(body, rawData, session);
+  } else {
+    renderIndividualAdminReport(body, rawData, session);
+  }
+
+  if (canSeeTeamReport) {
+    document.getElementById("dash-tab-team").addEventListener("click", () => {
+      window.AppData.dashboardTab = "team";
+      window.applyFilters();
+    });
+  }
+  document.getElementById("dash-tab-individual").addEventListener("click", () => {
+    window.AppData.dashboardTab = "individual";
+    window.applyFilters();
+  });
 }
 window.renderDashboardOverview = renderDashboardOverview;
 
@@ -376,9 +568,19 @@ window.renderDashboardOverview = renderDashboardOverview;
 window.applyFilters = function () {
   const view = window.AppData.currentView;
   const rawData = window.AppData.rawData;
-  const filteredData = window.AppData.filteredData;
+  let filteredData = window.AppData.filteredData;
 
   if (view === "insighthub") {
+    const session = (window.CrmAuth && window.CrmAuth.getSession()) || {};
+    // Sales Admin only sees customers/orders that belong to their own AdminName —
+    // scoped here (not in insighthub.js) since it builds its customer list from
+    // this same rawData argument.
+    if (session.role === window.CrmRoles.ROLES.SALES_ADMIN && session.adminName) {
+      const scoped = rawData.filter((r) => window.getNormalizedAdmin(r) === session.adminName);
+      filteredData = scoped;
+      if (typeof window.renderInsightHub === "function") window.renderInsightHub(scoped, scoped);
+      return;
+    }
     if (typeof window.renderInsightHub === "function") {
       window.renderInsightHub(filteredData, rawData);
     }
@@ -388,7 +590,7 @@ window.applyFilters = function () {
 };
 
 const VIEW_TITLES = {
-  dashboard: ["Dashboard Overview", "ภาพรวมข้อมูลลูกค้าและยอดขาย"],
+  dashboard: ["Dashboard", "รายงานทีมและแอดมินรายบุคคล"],
   insighthub: ["Customer InsightHub", "วิเคราะห์เชิงลึกรายลูกค้า"],
   settings: ["Settings", "ตั้งค่าการเชื่อมต่อและระบบ"],
 };
