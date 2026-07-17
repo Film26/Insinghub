@@ -7,6 +7,10 @@ window.AppData = {
   overviewSearchTerm: "",
 };
 
+// ---------------------------------------------------------------------------
+// Shared row helpers (consumed by js/insighthub.js via window.*)
+// ---------------------------------------------------------------------------
+
 const __rowKeyCache = new WeakMap();
 
 function __normalizeKey(k) {
@@ -102,7 +106,7 @@ window.showToast = function (message, type) {
 };
 
 // ---------------------------------------------------------------------------
-// Data loading: API / file import / bundled sample data
+// Data loading: Google Sheets via the Apps Script API only
 // ---------------------------------------------------------------------------
 
 function setRawData(rows) {
@@ -111,53 +115,10 @@ function setRawData(rows) {
   window.applyFilters();
 }
 
-function parseSpreadsheetFile(file) {
-  return new Promise((resolve, reject) => {
-    if (typeof XLSX === "undefined") {
-      reject(new Error("ไลบรารี XLSX โหลดไม่สำเร็จ กรุณาตรวจสอบการเชื่อมต่ออินเทอร์เน็ต"));
-      return;
-    }
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("อ่านไฟล์ไม่สำเร็จ"));
-    reader.onload = (evt) => {
-      try {
-        const workbook = XLSX.read(evt.target.result, { type: "array", raw: false });
-        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
-        resolve(rows);
-      } catch (err) {
-        reject(err);
-      }
-    };
-    reader.readAsArrayBuffer(file);
-  });
-}
-
-async function handleImportFile(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  try {
-    const rows = await parseSpreadsheetFile(file);
-    if (!rows.length) {
-      window.showToast("ไฟล์นี้ไม่มีข้อมูล", "error");
-      return;
-    }
-    setRawData(rows);
-    window.showToast("นำเข้าข้อมูล " + rows.length.toLocaleString() + " แถวสำเร็จ", "success");
-  } catch (err) {
-    window.showToast("นำเข้าไฟล์ไม่สำเร็จ: " + err.message, "error");
-  } finally {
-    e.target.value = "";
-  }
-}
-
 async function loadFromApi() {
   const base = window.CrmApi.getBaseUrl();
   if (!base) {
-    window.showToast(
-      "ยังไม่ได้ตั้งค่า Apps Script URL — ไปที่ Settings หรือใช้ปุ่ม Load Sample Data / Import",
-      "error"
-    );
+    window.showToast("ยังไม่ได้เชื่อมต่อ Google Sheets — ไปที่ Settings เพื่อตั้งค่า Apps Script URL", "error");
     return;
   }
   try {
@@ -170,52 +131,6 @@ async function loadFromApi() {
   } catch (err) {
     window.showToast("โหลดข้อมูลไม่สำเร็จ: " + err.message, "error");
   }
-}
-
-function getSampleData() {
-  // Small embedded dataset so the whole UI (Overview + InsightHub) is explorable
-  // with zero Google Sheets setup. Column names match what getRowValue() looks for.
-  const rows = [];
-  const customers = [
-    { phone: "0812345671", name: "Somsri Jaidee", product: "COLLAGEN = 3", price: 1200, channel: "FB", admin: "แอน" },
-    { phone: "0812345672", name: "Malee Suk", product: "GOLD = 3", price: 1800, channel: "LINE", admin: "บีม" },
-    { phone: "0812345673", name: "Anan Chai", product: "PLUS = 6", price: 950, channel: "IG", admin: "แอน" },
-    { phone: "0812345674", name: "Nid Rungrueang", product: "WISS = 2", price: 1500, channel: "WEB", admin: "ซี" },
-    { phone: "0812345675", name: "Ploy Wongsakul", product: "KIDES ORIGINAL = 3", price: 3200, channel: "TELESALE", admin: "บีม" },
-    { phone: "0812345676", name: "Chai Somboon", product: "GOLD = 2", price: 800, channel: "FB", admin: "ดาว" },
-  ];
-  // Orders per customer as [daysBeforeMaxDate, revenueMultiplier]
-  const schedule = {
-    0: [[280, 1], [180, 1.1], [70, 0.9], [10, 1]], // active/refill
-    1: [[200, 1], [100, 1]], // risk
-    2: [[310, 1]], // churn (single old order)
-    3: [[150, 1], [90, 1], [45, 1], [5, 1]], // healthy repeat
-    4: [[260, 2], [130, 2], [15, 2]], // high LTV whale
-    5: [[20, 1]], // new
-  };
-  const maxDate = new Date(2025, 11, 20); // 20 Dec 2025 acts as "today" for the sample
-
-  customers.forEach((c, idx) => {
-    (schedule[idx] || []).forEach(([daysBefore, mult]) => {
-      const d = new Date(maxDate.getTime() - daysBefore * 24 * 60 * 60 * 1000);
-      const dd = String(d.getDate()).padStart(2, "0");
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const yyyy = d.getFullYear();
-      rows.push({
-        "วันที่สร้าง": `${dd}/${mm}/${yyyy}`,
-        "Phone": c.phone,
-        "CustomerName": c.name,
-        "Product Set": c.product,
-        "ยอดขาย": String(Math.round(c.price * mult)),
-        "Order type": "SALE",
-        "ช่องทาง": c.channel,
-        "ชื่อแอดมิน": c.admin,
-        "Remark": "",
-      });
-    });
-  });
-
-  return rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -306,11 +221,11 @@ function emptyStateHtml(message) {
       <i class="fas fa-database"></i>
       <div>${message}</div>
       <div class="empty-actions">
-        <button class="btn btn-primary" onclick="document.getElementById('load-sample-btn').click()">
-          <i class="fas fa-flask"></i> Load Sample Data
+        <button class="btn btn-primary" onclick="document.getElementById('refresh-data-btn').click()">
+          <i class="fas fa-rotate"></i> Refresh
         </button>
-        <button class="btn btn-secondary" onclick="document.getElementById('import-data-btn').click()">
-          <i class="fas fa-file-import"></i> Import File
+        <button class="btn btn-secondary" onclick="document.querySelector('.nav-item[data-view=\\'settings\\']').click()">
+          <i class="fas fa-gear"></i> ไปที่ Settings
         </button>
       </div>
     </div>
@@ -517,7 +432,11 @@ function renderDashboardOverview(filteredData, rawData) {
   const ROLES = window.CrmRoles.ROLES;
 
   if (!rawData || rawData.length === 0) {
-    container.innerHTML = emptyStateHtml("ยังไม่มีข้อมูล กรุณา Import ไฟล์ หรือกดโหลดข้อมูลตัวอย่าง");
+    container.innerHTML = emptyStateHtml(
+      window.CrmApi.getBaseUrl()
+        ? "ยังไม่มีข้อมูลในชีต Orders หรือโหลดไม่สำเร็จ ลองกด Refresh อีกครั้ง"
+        : "ยังไม่ได้เชื่อมต่อ Google Sheets กรุณาไปที่ Settings เพื่อตั้งค่า Apps Script URL"
+    );
     return;
   }
 
@@ -637,14 +556,6 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
-  document.getElementById("import-data-btn").addEventListener("click", () => {
-    document.getElementById("import-file-input").click();
-  });
-  document.getElementById("import-file-input").addEventListener("change", handleImportFile);
-  document.getElementById("load-sample-btn").addEventListener("click", () => {
-    setRawData(getSampleData());
-    window.showToast("โหลดข้อมูลตัวอย่างสำเร็จ", "success");
-  });
   document.getElementById("refresh-data-btn").addEventListener("click", loadFromApi);
 
   switchView("dashboard");
