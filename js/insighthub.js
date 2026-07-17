@@ -337,7 +337,7 @@ function renderInsightHub(filteredData, rawData) {
   try {
 
   if (!rawData || rawData.length === 0) {
-    container.innerHTML = '<div style="text-align:center; padding:50px; color:#999;">No data loaded. Please import or load sample data.</div>';
+    container.innerHTML = '<div style="text-align:center; padding:50px; color:#999;">ยังไม่มีข้อมูล กรุณาไปที่ Settings เพื่อเชื่อมต่อ Google Sheets แล้วกด Refresh</div>';
     return;
   }
 
