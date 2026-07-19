@@ -69,5 +69,19 @@
     getOrders() {
       return apiRequest("orders", {});
     },
+    // requestUser is checked server-side against the Users sheet — a client
+    // can't just claim to be super_admin to unlock these.
+    listUsers(requestUser) {
+      return apiRequest("listUsers", { requestUser });
+    },
+    upsertUser(requestUser, { targetUsername, role, adminName, newPassword }) {
+      return apiRequest("upsertUser", {
+        requestUser,
+        targetUsername,
+        role,
+        adminName: adminName || "",
+        newPassword: newPassword || "",
+      });
+    },
   };
 })();
