@@ -1,4 +1,8 @@
 // js/settings.js
+// Renders the Settings view: Apps Script connection, account info, data controls,
+// and (Super Admin only) the User Management panel for role/AdminName assignment.
+// Invoked on-demand by dashboard.js (window.renderSettingsView) whenever that view is opened.
+
 function settingsRowCount() {
   return window.AppData && window.AppData.rawData ? window.AppData.rawData.length : 0;
 }
