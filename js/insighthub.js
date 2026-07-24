@@ -89,6 +89,20 @@ function parseToDateObj(dateStr) {
   return null;
 }
 
+// Sales Note text is typed directly into a <textarea> in this app and later
+// rendered back as HTML for every admin viewing the list/profile — unlike
+// the other columns (which come from imported sheet data), this one needs
+// escaping to avoid a stored-XSS round trip through Google Sheets.
+function escapeHtml(str) {
+  return String(str == null ? "" : str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+window.escapeHtml = escapeHtml; // reused by js/settings.js for the status-options editor
+
 function formatDateDisplay(dObj) {
   if (!dObj) return "-";
   const dd = String(dObj.getDate()).padStart(2, '0');
@@ -682,16 +696,43 @@ function renderInsightHub(filteredData, rawData) {
       .profile-detail-card h3 { font-size: 16px; font-weight: 700; color: #1e293b; margin: 0 0 15px 0; border-bottom: 1px solid #f1f5f9; padding-bottom: 10px; }
       .profile-detail-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #f8fafc; }
       .profile-detail-row:last-child { border-bottom: none; }
+
+      .note-status-btn {
+        width: 100%; display: flex; align-items: center; justify-content: space-between;
+        padding: 10px 12px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fff;
+        cursor: pointer; font-size: 13px; color: #334155; text-align: left;
+      }
+      .note-status-btn:hover { border-color: #d95f1d; }
+      .note-status-panel {
+        display: none; position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+        background: #fff; border: 1px solid #ccc; border-radius: 8px;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.15); padding: 8px; z-index: 20;
+        max-height: 220px; overflow-y: auto;
+      }
+      .note-status-panel.show { display: block; }
+      .note-status-option {
+        display: flex; align-items: center; gap: 8px; padding: 7px 6px;
+        font-size: 13px; color: #334155; cursor: pointer; border-radius: 5px;
+      }
+      .note-status-option:hover { background: #f5f5f5; }
     `;
     document.head.appendChild(style);
 
     document.addEventListener('click', function(e) {
+      let changed = false;
       if (!e.target.closest('.th-container') && !e.target.closest('.excel-dropdown-menu')) {
         if (window.insightHubState.activeDropdown) {
           window.insightHubState.activeDropdown = null;
-          if (window.applyFilters) window.applyFilters();
+          changed = true;
         }
       }
+      if (!e.target.closest('.note-status-btn') && !e.target.closest('.note-status-panel')) {
+        if (window.insightHubState.noteEditor && window.insightHubState.noteEditor.dropdownOpen) {
+          window.insightHubState.noteEditor.dropdownOpen = false;
+          changed = true;
+        }
+      }
+      if (changed && window.applyFilters) window.applyFilters();
     });
   }
 
@@ -977,6 +1018,16 @@ function renderInsightHub(filteredData, rawData) {
 
   window.insightHubState.allCustomers = customers;
 
+  // Overlay Sales Note / contact-status onto each customer. Runs every render
+  // (not just on a cache miss) so a note saved on the profile page shows up
+  // in the list immediately without recomputing the whole customers array.
+  const notesByKey = (window.AppData && window.AppData.notesByKey) || {};
+  customers.forEach(c => {
+    const n = notesByKey[c.phone];
+    c.latestNote = n && n.note ? n.note : "-";
+    c.latestStatuses = n && n.statuses && n.statuses.length ? n.statuses.join(", ") : "-";
+  });
+
   if (state.selectedCustomerPhone) {
     const customer = customers.find(c => c.phone === state.selectedCustomerPhone);
     if (customer) {
@@ -1200,6 +1251,12 @@ function renderInsightHub(filteredData, rawData) {
               ${makeExcelHeaderTh('lastAdmin', 'Last Admin', 'th-action')}
               
               ${state.availableYears.map(y => makeExcelHeaderTh('tier' + y, `ยอดซื้อปี ${y}`, 'th-tiers')).join('')}
+              ${makeExcelHeaderTh('latestStatuses', 'สถานะล่าสุด (Contact)', 'th-action')}
+              <th class="th-action">
+                <div class="th-container">
+                  <span class="th-label" onclick="setHubSort('latestNote')">Sales Note ล่าสุด ${getSortIcon('latestNote')}</span>
+                </div>
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -1230,6 +1287,8 @@ function renderInsightHub(filteredData, rawData) {
                 <td>${c.lastAdmin}</td>
                 
                 ${state.availableYears.map(y => '<td style="text-align: right; font-weight: 500;">' + c['tier' + y] + '</td>').join('')}
+                <td>${escapeHtml(c.latestStatuses)}</td>
+                <td style="max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${escapeHtml(c.latestNote)}">${escapeHtml(c.latestNote)}</td>
               </tr>
             `).join('')}
           </tbody>
@@ -1399,6 +1458,8 @@ window.exportInsightHubExcel = function() {
       'Last Admin': c.lastAdmin
     };
     years.forEach(y => { row[`ยอดซื้อปี ${y}`] = c['tier' + y]; });
+    row['สถานะล่าสุด (Contact)'] = c.latestStatuses;
+    row['Sales Note ล่าสุด'] = c.latestNote;
     return row;
   });
 
@@ -1535,7 +1596,138 @@ function generateAiSummary(c) {
     '</div>';
 }
 
+function formatDateTimeDisplay(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const yyyy = d.getFullYear();
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  return `${dd}/${mm}/${yyyy} ${hh}:${mi}`;
+}
+
+// Sales Note card: multi-select contact status + free-text note, shown under
+// AI Summary. Draft edits live in state.noteEditor (keyed to the customer
+// being viewed) so a checkbox toggle can re-render the page without wiping
+// whatever the admin has already typed/selected.
+function renderSalesNoteCard(c) {
+  const state = window.insightHubState;
+  const editor = state.noteEditor;
+  const statusOptions = (window.AppData && window.AppData.statusOptions && window.AppData.statusOptions.length)
+    ? window.AppData.statusOptions
+    : window.DEFAULT_STATUS_OPTIONS;
+  const saved = (window.AppData && window.AppData.notesByKey && window.AppData.notesByKey[c.phone]) || null;
+  const updatedInfo = saved && saved.updatedAt
+    ? `<span style="font-size:11.5px; color:#94a3b8;">อัปเดตล่าสุดโดย <strong>${escapeHtml(saved.updatedBy || '-')}</strong> เมื่อ ${formatDateTimeDisplay(saved.updatedAt)}</span>`
+    : '';
+
+  return `
+    <div class="profile-detail-card" style="background: white; border: 1px solid #e2e8f0; border-radius: 16px; padding: 25px; box-shadow: 0 4px 15px rgba(0,0,0,0.02); margin-bottom: 25px;">
+      <h3><i class="fas fa-note-sticky" style="margin-right: 8px; color: #d95f1d;"></i>Sales Note</h3>
+      <div style="display: flex; flex-direction: column; gap: 14px;">
+        <div style="position: relative;">
+          <label style="font-size: 12px; font-weight: 600; color: #64748b; display: block; margin-bottom: 6px;">สถานะการติดต่อ (เลือกได้มากกว่า 1)</label>
+          <button type="button" class="note-status-btn" onclick="event.stopPropagation(); toggleNoteStatusDropdown()">
+            <span>${editor.statuses.length ? escapeHtml(editor.statuses.join(', ')) : 'เลือกสถานะ...'}</span>
+            <i class="fas fa-chevron-down" style="font-size: 11px; color: #999;"></i>
+          </button>
+          <div class="note-status-panel ${editor.dropdownOpen ? 'show' : ''}" onclick="event.stopPropagation();">
+            ${statusOptions.length === 0
+              ? `<div style="padding: 10px; color: #999; font-size: 12px;">ยังไม่มีสถานะให้เลือก ไปที่ Settings เพื่อเพิ่ม</div>`
+              : statusOptions.map(opt => {
+                  const checked = editor.statuses.includes(opt);
+                  const safeId = 'note-status-' + opt.replace(/[^a-zA-Z0-9ก-๙]/g, '_');
+                  return `
+                    <label class="note-status-option" for="${safeId}">
+                      <input type="checkbox" id="${safeId}" ${checked ? 'checked' : ''} onchange="toggleNoteStatusCheck('${opt.replace(/'/g, "\\'")}', this.checked)">
+                      <span>${escapeHtml(opt)}</span>
+                    </label>
+                  `;
+                }).join('')
+            }
+          </div>
+        </div>
+
+        <div>
+          <label style="font-size: 12px; font-weight: 600; color: #64748b; display: block; margin-bottom: 6px;">โน้ตการขาย</label>
+          <textarea id="sales-note-textarea" oninput="updateNoteDraftText(this.value)" placeholder="พิมพ์บันทึกการติดต่อลูกค้า..." style="width: 100%; min-height: 90px; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; font-size: 13px; font-family: inherit; resize: vertical; box-sizing: border-box;">${escapeHtml(editor.text)}</textarea>
+        </div>
+
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
+          ${updatedInfo || '<span></span>'}
+          <button class="btn btn-primary" onclick="saveCustomerNote()" style="padding: 8px 22px;"><i class="fas fa-save"></i> บันทึก</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+window.toggleNoteStatusDropdown = function() {
+  const state = window.insightHubState;
+  if (!state.noteEditor) return;
+  state.noteEditor.dropdownOpen = !state.noteEditor.dropdownOpen;
+  if (window.applyFilters) window.applyFilters();
+};
+
+window.toggleNoteStatusCheck = function(label, checked) {
+  const state = window.insightHubState;
+  if (!state.noteEditor) return;
+  const idx = state.noteEditor.statuses.indexOf(label);
+  if (checked && idx === -1) state.noteEditor.statuses.push(label);
+  if (!checked && idx !== -1) state.noteEditor.statuses.splice(idx, 1);
+  if (window.applyFilters) window.applyFilters();
+};
+
+// Not re-rendered on every keystroke (a full re-render would drop textarea
+// focus/cursor position while typing) — just tracked in state until Save.
+window.updateNoteDraftText = function(value) {
+  const state = window.insightHubState;
+  if (!state.noteEditor) return;
+  state.noteEditor.text = value;
+};
+
+window.saveCustomerNote = async function() {
+  const state = window.insightHubState;
+  const editor = state.noteEditor;
+  if (!editor) return;
+  const customer = (state.allCustomers || []).find(c => c.phone === editor.forPhone);
+  if (!customer) return;
+  const session = (window.CrmAuth && window.CrmAuth.getSession()) || {};
+
+  try {
+    await window.CrmApi.upsertNote({
+      customerKey: customer.phone,
+      customerName: customer.name,
+      note: editor.text,
+      statuses: editor.statuses.join('|'),
+      requestUser: session.username || '',
+    });
+    window.showToast('บันทึก Sales Note แล้ว', 'success');
+    editor.dropdownOpen = false;
+    if (window.loadNotesAndStatusOptions) {
+      await window.loadNotesAndStatusOptions(); // also re-renders (list + this profile) on success
+    } else if (window.applyFilters) {
+      window.applyFilters();
+    }
+  } catch (err) {
+    window.showToast('บันทึกไม่สำเร็จ: ' + err.message, 'error');
+  }
+};
+
 function renderCustomerProfileView(c, container, filteredData, rawData) {
+  const state = window.insightHubState;
+  if (!state.noteEditor || state.noteEditor.forPhone !== c.phone) {
+    const saved = (window.AppData && window.AppData.notesByKey && window.AppData.notesByKey[c.phone]) || null;
+    state.noteEditor = {
+      forPhone: c.phone,
+      statuses: saved ? saved.statuses.slice() : [],
+      text: saved ? saved.note : '',
+      dropdownOpen: false,
+    };
+  }
+
   const html = `
     <div style="margin-bottom: 20px;">
       <button class="pag-btn" onclick="closeCustomerProfile()" style="display: inline-flex; align-items: center; gap: 8px; font-size: 13px; padding: 8px 16px; border: 1px solid #ddd; border-radius: 8px; background: white; cursor: pointer;">
@@ -1575,6 +1767,8 @@ function renderCustomerProfileView(c, container, filteredData, rawData) {
     <div style="background: #f8fafc; border: 1px solid #e2e8f0; padding: 20px; border-radius: 12px; margin-bottom: 25px; line-height: 1.6; font-size: 14px; color: #334155;">
       ${generateAiSummary(c)}
     </div>
+
+    ${renderSalesNoteCard(c)}
 
     <div class="profile-kpi-grid-4">
       <div class="profile-kpi-card">
