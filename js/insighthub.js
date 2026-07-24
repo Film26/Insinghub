@@ -477,6 +477,28 @@ function renderInsightHub(filteredData, rawData) {
       .customer-table tr:hover td {
         background-color: #fafafa;
       }
+      .hub-status-select, .hub-note-input {
+        font-family: inherit;
+        font-size: 12px;
+        padding: 5px 8px;
+        border: 1px solid #dfe3e8;
+        border-radius: 6px;
+        background: #fff;
+        color: #333;
+        box-sizing: border-box;
+      }
+      .hub-status-select {
+        min-width: 140px;
+        cursor: pointer;
+      }
+      .hub-note-input {
+        min-width: 180px;
+        width: 100%;
+      }
+      .hub-status-select:focus, .hub-note-input:focus {
+        outline: none;
+        border-color: #d95f1d;
+      }
       
       .th-container {
         display: flex;
@@ -1260,7 +1282,15 @@ function renderInsightHub(filteredData, rawData) {
             </tr>
           </thead>
           <tbody>
-            ${pageEntries.map(c => `
+            ${(() => {
+              const inlineStatusOptions = (window.AppData && window.AppData.statusOptions && window.AppData.statusOptions.length)
+                ? window.AppData.statusOptions
+                : window.DEFAULT_STATUS_OPTIONS;
+              return pageEntries.map(c => {
+                const savedNote = notesByKey[c.phone] || null;
+                const currentStatus = (savedNote && savedNote.statuses && savedNote.statuses.length) ? savedNote.statuses[0] : "";
+                const currentNoteText = (savedNote && savedNote.note) ? savedNote.note : "";
+                return `
               <tr>
                 <td style="font-weight: 600; cursor: pointer; color: #d95f1d; text-decoration: underline;" onclick="openCustomerProfile('${c.phone}')">${c.displayPhone}</td>
                 <td style="font-weight: 600; cursor: pointer; color: #d95f1d; text-decoration: underline;" onclick="openCustomerProfile('${c.phone}')">${c.name}</td>
@@ -1287,10 +1317,19 @@ function renderInsightHub(filteredData, rawData) {
                 <td>${c.lastAdmin}</td>
                 
                 ${state.availableYears.map(y => '<td style="text-align: right; font-weight: 500;">' + c['tier' + y] + '</td>').join('')}
-                <td>${escapeHtml(c.latestStatuses)}</td>
-                <td style="max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${escapeHtml(c.latestNote)}">${escapeHtml(c.latestNote)}</td>
+                <td>
+                  <select class="hub-status-select" onchange="window.updateInlineStatus('${c.phone}', this.value)">
+                    <option value="" ${currentStatus === "" ? 'selected' : ''}>— เลือกสถานะ —</option>
+                    ${inlineStatusOptions.map(opt => `<option value="${escapeHtml(opt)}" ${currentStatus === opt ? 'selected' : ''}>${escapeHtml(opt)}</option>`).join('')}
+                  </select>
+                </td>
+                <td>
+                  <input type="text" class="hub-note-input" value="${escapeHtml(currentNoteText)}" placeholder="พิมพ์บันทึก..." onchange="window.updateInlineNote('${c.phone}', this.value)">
+                </td>
               </tr>
-            `).join('')}
+                `;
+              }).join('');
+            })()}
           </tbody>
         </table>
       </div>
@@ -1708,6 +1747,61 @@ window.saveCustomerNote = async function() {
     editor.dropdownOpen = false;
     if (window.loadNotesAndStatusOptions) {
       await window.loadNotesAndStatusOptions(); // also re-renders (list + this profile) on success
+    } else if (window.applyFilters) {
+      window.applyFilters();
+    }
+  } catch (err) {
+    window.showToast('บันทึกไม่สำเร็จ: ' + err.message, 'error');
+  }
+};
+
+// Inline quick-edit for the Status/Note columns on the customer table (as
+// opposed to the multi-select Sales Note card on the profile page). Saves a
+// single status + the existing note text, or vice versa, on change/blur.
+window.updateInlineStatus = async function(phone, value) {
+  const state = window.insightHubState;
+  const customer = (state.allCustomers || []).find(cc => cc.phone === phone);
+  if (!customer) return;
+  const session = (window.CrmAuth && window.CrmAuth.getSession()) || {};
+  const saved = (window.AppData && window.AppData.notesByKey && window.AppData.notesByKey[phone]) || null;
+
+  try {
+    await window.CrmApi.upsertNote({
+      customerKey: phone,
+      customerName: customer.name,
+      note: saved ? saved.note : '',
+      statuses: value,
+      requestUser: session.username || '',
+    });
+    window.showToast('บันทึกสถานะแล้ว', 'success');
+    if (window.loadNotesAndStatusOptions) {
+      await window.loadNotesAndStatusOptions();
+    } else if (window.applyFilters) {
+      window.applyFilters();
+    }
+  } catch (err) {
+    window.showToast('บันทึกไม่สำเร็จ: ' + err.message, 'error');
+  }
+};
+
+window.updateInlineNote = async function(phone, value) {
+  const state = window.insightHubState;
+  const customer = (state.allCustomers || []).find(cc => cc.phone === phone);
+  if (!customer) return;
+  const session = (window.CrmAuth && window.CrmAuth.getSession()) || {};
+  const saved = (window.AppData && window.AppData.notesByKey && window.AppData.notesByKey[phone]) || null;
+
+  try {
+    await window.CrmApi.upsertNote({
+      customerKey: phone,
+      customerName: customer.name,
+      note: value,
+      statuses: (saved && saved.statuses) ? saved.statuses.join('|') : '',
+      requestUser: session.username || '',
+    });
+    window.showToast('บันทึกโน้ตแล้ว', 'success');
+    if (window.loadNotesAndStatusOptions) {
+      await window.loadNotesAndStatusOptions();
     } else if (window.applyFilters) {
       window.applyFilters();
     }
