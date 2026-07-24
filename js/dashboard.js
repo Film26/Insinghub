@@ -1,10 +1,14 @@
 // js/dashboard.js
 
+window.DEFAULT_STATUS_OPTIONS = ["คุยแล้ว", "ยังไม่รับสาย", "ไม่สะดวกให้โทร", "ไม่ได้ทานแล้ว"];
+
 window.AppData = {
   rawData: [],
   filteredData: [],
   currentView: "dashboard",
   overviewSearchTerm: "",
+  notesByKey: {},
+  statusOptions: window.DEFAULT_STATUS_OPTIONS.slice(),
 };
 
 // ---------------------------------------------------------------------------
@@ -131,7 +135,53 @@ async function loadFromApi() {
   } catch (err) {
     window.showToast("โหลดข้อมูลไม่สำเร็จ: " + err.message, "error");
   }
+  // Independent of order loading above — Sales Note/status-config sheets are
+  // optional and newer than the Orders sheet, so a failure here (e.g. sheet
+  // not created yet) shouldn't block or error out the main data load.
+  loadNotesAndStatusOptions();
 }
+
+// Fetches saved customer notes + the configurable contact-status list, and
+// rebuilds window.AppData.notesByKey (CustomerKey -> latest note/statuses).
+// Called on every Refresh, and again after a note or status-option save so
+// the InsightHub list/profile reflect the change immediately.
+async function loadNotesAndStatusOptions() {
+  if (!window.CrmApi.getBaseUrl()) return;
+
+  try {
+    const notesResult = await window.CrmApi.getNotes();
+    const notesByKey = {};
+    (notesResult.rows || []).forEach((row) => {
+      const key = (row.CustomerKey || "").toString().trim();
+      if (!key) return;
+      const statusesRaw = (row.Statuses || "").toString();
+      notesByKey[key] = {
+        note: (row.Note || "").toString(),
+        statuses: statusesRaw ? statusesRaw.split("|").map((s) => s.trim()).filter(Boolean) : [],
+        updatedAt: row.UpdatedAt || "",
+        updatedBy: row.UpdatedBy || "",
+      };
+    });
+    window.AppData.notesByKey = notesByKey;
+  } catch (err) {
+    console.warn("[loadNotesAndStatusOptions] โหลด CustomerNotes ไม่สำเร็จ:", err.message);
+  }
+
+  try {
+    const statusResult = await window.CrmApi.getStatusOptions();
+    if (statusResult.options && statusResult.options.length) {
+      window.AppData.statusOptions = statusResult.options;
+    }
+  } catch (err) {
+    console.warn("[loadNotesAndStatusOptions] โหลดสถานะการติดต่อไม่สำเร็จ:", err.message);
+  }
+
+  // Orders may already have rendered the list before this resolves (it's
+  // fetched in parallel, not awaited by the initial load) — re-render so the
+  // note/status overlay shows up without the user having to interact first.
+  if (window.applyFilters) window.applyFilters();
+}
+window.loadNotesAndStatusOptions = loadNotesAndStatusOptions;
 
 // ---------------------------------------------------------------------------
 // Dashboard: Team Report + Individual Admin report (role-scoped)
