@@ -1,7 +1,4 @@
 // js/settings.js
-// Renders the Settings view: Apps Script connection, account info, data controls,
-// and (Super Admin only) the User Management panel for role/AdminName assignment.
-// Invoked on-demand by dashboard.js (window.renderSettingsView) whenever that view is opened.
 
 function settingsRowCount() {
   return window.AppData && window.AppData.rawData ? window.AppData.rawData.length : 0;
@@ -68,6 +65,37 @@ function renderSettingsView() {
     `
     : "";
 
+  // Status options (the multi-select shown on a customer's Sales Note card) —
+  // editable by Super Admin and Manager; every role can still pick from the
+  // list on a customer profile.
+  const canEditStatusOptions = isSuperAdmin || role === ROLES.MANAGER;
+  const statusOptionsCardHtml = canEditStatusOptions
+    ? `
+      <div class="settings-card" style="grid-column: 1 / -1;">
+        <h3><i class="fas fa-list-check"></i> จัดการสถานะการติดต่อ (Sales Note)</h3>
+        <p class="text-muted" style="font-size:12.5px; margin-top:-8px;">
+          รายการสถานะที่แอดมินเลือกได้ตอนบันทึก Sales Note ในหน้าโปรไฟล์ลูกค้า (เลือกได้มากกว่า 1 รายการต่อครั้ง)
+        </p>
+        <div id="status-options-rows" style="display:flex; flex-direction:column; gap:8px; margin-bottom:10px;">
+          ${(window.AppData.statusOptions && window.AppData.statusOptions.length ? window.AppData.statusOptions : window.DEFAULT_STATUS_OPTIONS)
+            .map(
+              (opt) => `
+            <div class="status-option-row" style="display:flex; gap:8px;">
+              <input type="text" class="so-label" value="${window.escapeHtml(opt)}" style="flex-grow:1;">
+              <button type="button" class="btn btn-secondary so-remove-btn"><i class="fas fa-trash"></i></button>
+            </div>
+          `
+            )
+            .join("")}
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary" id="so-add-btn"><i class="fas fa-plus"></i> เพิ่มสถานะ</button>
+          <button class="btn btn-primary" id="so-save-btn"><i class="fas fa-save"></i> บันทึกรายการสถานะ</button>
+        </div>
+      </div>
+    `
+    : "";
+
   container.innerHTML = `
     <div class="settings-grid">
       ${connectionCardHtml}
@@ -124,6 +152,7 @@ function renderSettingsView() {
       </div>
 
       ${userMgmtCardHtml}
+      ${statusOptionsCardHtml}
     </div>
   `;
 
@@ -150,6 +179,10 @@ function renderSettingsView() {
     });
 
     loadUserManagementPanel(session);
+  }
+
+  if (canEditStatusOptions) {
+    wireStatusOptionsCard(session);
   }
 
   document.getElementById("settings-logout-btn").addEventListener("click", () => {
@@ -307,6 +340,69 @@ function renderUserManagementTable(body, session, users) {
       loadUserManagementPanel(session);
     } catch (err) {
       window.showToast("เพิ่มผู้ใช้ไม่สำเร็จ: " + err.message, "error");
+    }
+  });
+}
+
+// Add/remove rows are plain DOM manipulation (no full renderSettingsView()
+// re-render) so typing in one input never gets interrupted by a redraw —
+// same reasoning as the Sales Note textarea in js/insighthub.js. Save reads
+// current input values straight off the DOM and does a full re-render after
+// the server confirms, same as the user-management save buttons above.
+function wireStatusOptionsCard(session) {
+  const rowsContainer = document.getElementById("status-options-rows");
+  const addBtn = document.getElementById("so-add-btn");
+  const saveBtn = document.getElementById("so-save-btn");
+  if (!rowsContainer || !addBtn || !saveBtn) return;
+
+  function makeRow(value) {
+    const row = document.createElement("div");
+    row.className = "status-option-row";
+    row.style.cssText = "display:flex; gap:8px;";
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "so-label";
+    input.value = value || "";
+    input.style.flexGrow = "1";
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "btn btn-secondary";
+    removeBtn.innerHTML = '<i class="fas fa-trash"></i>';
+    removeBtn.addEventListener("click", () => row.remove());
+
+    row.appendChild(input);
+    row.appendChild(removeBtn);
+    return row;
+  }
+
+  rowsContainer.querySelectorAll(".so-remove-btn").forEach((btn) => {
+    btn.addEventListener("click", () => btn.closest(".status-option-row").remove());
+  });
+
+  addBtn.addEventListener("click", () => {
+    const row = makeRow("");
+    rowsContainer.appendChild(row);
+    row.querySelector("input").focus();
+  });
+
+  saveBtn.addEventListener("click", async () => {
+    const values = Array.from(rowsContainer.querySelectorAll(".so-label"))
+      .map((inp) => inp.value.trim())
+      .filter(Boolean);
+    const unique = Array.from(new Set(values));
+    if (unique.length === 0) {
+      window.showToast("ต้องมีสถานะอย่างน้อย 1 รายการ", "error");
+      return;
+    }
+    try {
+      await window.CrmApi.saveStatusOptions(session.username, unique.join("|"));
+      window.showToast("บันทึกรายการสถานะแล้ว", "success");
+      if (window.loadNotesAndStatusOptions) await window.loadNotesAndStatusOptions();
+      renderSettingsView();
+    } catch (err) {
+      window.showToast("บันทึกไม่สำเร็จ: " + err.message, "error");
     }
   });
 }
