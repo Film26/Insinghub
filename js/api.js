@@ -1,7 +1,4 @@
 // js/api.js
-// Thin client for the Google Apps Script backend (apps-script/Code.gs).
-// Deploy Code.gs as a Web App ("Execute as: Me", "Who has access: Anyone with the link"),
-// then paste the resulting /exec URL into the Settings page (stored in localStorage).
 
 (function () {
   const BASE_URL_KEY = "crm_api_base_url";
@@ -82,6 +79,24 @@
         adminName: adminName || "",
         newPassword: newPassword || "",
       });
+    },
+    getNotes() {
+      return apiRequest("notes", {});
+    },
+    upsertNote({ customerKey, customerName, note, statuses, requestUser }) {
+      return apiRequest("upsertNote", {
+        customerKey,
+        customerName: customerName || "",
+        note: note || "",
+        statuses: statuses || "",
+        requestUser: requestUser || "",
+      });
+    },
+    getStatusOptions() {
+      return apiRequest("statusOptions", {});
+    },
+    saveStatusOptions(requestUser, optionsPipeJoined) {
+      return apiRequest("saveStatusOptions", { requestUser, options: optionsPipeJoined || "" });
     },
   };
 })();
