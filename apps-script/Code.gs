@@ -44,6 +44,29 @@ var CUSTOMER_NOTES_SHEET_NAME = "CustomerNotes";
 var STATUS_CONFIG_SHEET_NAME = "Config_Status";
 var DEFAULT_STATUS_OPTIONS = ["คุยแล้ว", "ยังไม่รับสาย", "ไม่สะดวกให้โทร", "ไม่ได้ทานแล้ว", "สนใจซื้อซ้ำ", "รอโปรโมชั่น", "ขอคิดดูก่อน", "ปิดการขายแล้ว", "เปลี่ยนไปใช้ยี่ห้ออื่น", "ติดต่อไม่ได้", "เบอร์ผิด/ไม่ใช่ลูกค้า"];
 
+// Bootstrap accounts — log in and pass Super Admin/Manager checks without
+// needing a row in the Users sheet at all. Useful to get started, or to keep
+// using permanently instead of maintaining a Users sheet. Edit/remove entries
+// here directly (only people with edit access to this Apps Script project can
+// see or change these values).
+// sales_admin entries need `adminName` set to the exact value that appears in
+// the Orders sheet's admin-name column (ชื่อแอดมิน/Admin) for that person's
+// rows — leaving it blank means that account sees ALL customers, unscoped.
+var BOOTSTRAP_ACCOUNTS = [
+  { username: "Super_Admin@queenmaker.ac.th", password: "Super_Admin_May", role: "super_admin", adminName: "" },
+  { username: "Manager@queenmaker.ac.th", password: "manager_2026", role: "manager", adminName: "" },
+  { username: "sales_admin@queenmaker.ac.th", password: "sales_admin", role: "sales_admin", adminName: "" },
+];
+
+function findBootstrapAccount(username) {
+  if (!username) return null;
+  var uname = username.toString().trim().toLowerCase();
+  for (var i = 0; i < BOOTSTRAP_ACCOUNTS.length; i++) {
+    if (BOOTSTRAP_ACCOUNTS[i].username.toLowerCase() === uname) return BOOTSTRAP_ACCOUNTS[i];
+  }
+  return null;
+}
+
 function getSpreadsheet() {
   return SpreadsheetApp.openById(SPREADSHEET_ID);
 }
@@ -77,6 +100,12 @@ function doGet(e) {
     }
     if (action === "saveStatusOptions") {
       return handleSaveStatusOptions(e.parameter);
+    }
+    if (action === "appConfig") {
+      return handleGetAppConfig();
+    }
+    if (action === "saveAppConfig") {
+      return handleSaveAppConfig(e.parameter);
     }
     return jsonOutput({ success: false, error: "Unknown action: " + action });
   } catch (err) {
@@ -123,6 +152,19 @@ function getUsersHeaderIndex(headerRow) {
 function handleLogin(username, password) {
   if (!username || !password) {
     return jsonOutput({ success: false, error: "กรุณากรอกชื่อผู้ใช้และรหัสผ่าน" });
+  }
+
+  var bootstrap = findBootstrapAccount(username);
+  if (bootstrap) {
+    if (password !== bootstrap.password) {
+      return jsonOutput({ success: false, error: "รหัสผ่านไม่ถูกต้อง" });
+    }
+    return jsonOutput({
+      success: true,
+      username: bootstrap.username,
+      role: bootstrap.role,
+      adminName: bootstrap.adminName,
+    });
   }
 
   var sheet;
@@ -207,6 +249,11 @@ function handleGetOrders() {
 // role claim coming from the client for permission checks.
 function requireSuperAdmin(requestUsername) {
   if (!requestUsername) throw new Error("ต้องระบุ requestUser");
+  var bootstrap = findBootstrapAccount(requestUsername);
+  if (bootstrap) {
+    if (bootstrap.role !== "super_admin") throw new Error("เฉพาะ Super Admin เท่านั้นที่จัดการผู้ใช้งานได้");
+    return;
+  }
   var sheet = getUsersSheet();
   var data = sheet.getDataRange().getValues();
   var idx = getUsersHeaderIndex(data[0]);
@@ -224,6 +271,13 @@ function requireSuperAdmin(requestUsername) {
 // settings that Super Admin and Manager may both edit (e.g. status options).
 function requireSuperAdminOrManager(requestUsername) {
   if (!requestUsername) throw new Error("ต้องระบุ requestUser");
+  var bootstrap = findBootstrapAccount(requestUsername);
+  if (bootstrap) {
+    if (bootstrap.role !== "super_admin" && bootstrap.role !== "manager") {
+      throw new Error("เฉพาะ Super Admin หรือ Manager เท่านั้นที่จัดการสถานะการติดต่อได้");
+    }
+    return;
+  }
   var sheet = getUsersSheet();
   var data = sheet.getDataRange().getValues();
   var idx = getUsersHeaderIndex(data[0]);
@@ -482,4 +536,95 @@ function handleSaveStatusOptions(params) {
   sheet.getRange(2, 1, options.length, 1).setValues(options.map(function (o) { return [o]; }));
 
   return jsonOutput({ success: true, options: options });
+}
+
+// ---------------------------------------------------------------------------
+// Generic app config (Loyalty Index thresholds, Admin Priority × Segment
+// matrix, Trend Visual thresholds, refill buffer multiplier). One "Config_App"
+// sheet, one row per key, value stored as JSON — avoids a dedicated sheet +
+// handler pair per setting. Editable from Settings by Super Admin/Manager;
+// readable by anyone so every role's calculations use the same config.
+// ---------------------------------------------------------------------------
+
+var APP_CONFIG_SHEET_NAME = "Config_App";
+
+// Mirrors the exact if/else priority logic that used to be hardcoded in
+// js/insighthub.js's buildInsightCustomers(), so switching to this config
+// changes nothing until someone actually edits it in Settings.
+var DEFAULT_APP_CONFIG = {
+  loyaltyIndex: { seedlingMaxDays: 45, regularMaxDays: 180, veteranMaxDays: 365 },
+  adminPriorityMatrix: {
+    "NEW|NEW": "Medium", "NEW|ACTIVE": "Medium", "NEW|REFILL": "High", "NEW|RISK": "Medium", "NEW|CHURN": "Medium",
+    "ACTIVE|NEW": "Medium", "ACTIVE|ACTIVE": "Low", "ACTIVE|REFILL": "High", "ACTIVE|RISK": "Low", "ACTIVE|CHURN": "Win-back",
+    "RISK|NEW": "Medium", "RISK|ACTIVE": "Low", "RISK|REFILL": "High", "RISK|RISK": "Medium", "RISK|CHURN": "Win-back",
+    "CHURN|NEW": "Medium", "CHURN|ACTIVE": "Low", "CHURN|REFILL": "High", "CHURN|RISK": "Win-back", "CHURN|CHURN": "Win-back"
+  },
+  trendVisual: { neutralBandPercent: 0, interpolateCurrentYear: true },
+  refillBuffer: 1.1
+};
+
+function handleGetAppConfig() {
+  var config = {};
+  for (var k in DEFAULT_APP_CONFIG) config[k] = DEFAULT_APP_CONFIG[k];
+
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(APP_CONFIG_SHEET_NAME);
+  if (sheet) {
+    var data = sheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      var key = (data[i][0] || "").toString().trim();
+      var raw = (data[i][1] || "").toString().trim();
+      if (!key || !raw) continue;
+      try {
+        config[key] = JSON.parse(raw);
+      } catch (e) {
+        // leave the default in place if a cell has invalid JSON
+      }
+    }
+  }
+  return jsonOutput({ success: true, config: config });
+}
+
+// params: requestUser (must be super_admin or manager), key, value (JSON string)
+function handleSaveAppConfig(params) {
+  try {
+    requireSuperAdminOrManager(params.requestUser);
+  } catch (err) {
+    return jsonOutput({ success: false, error: err.message });
+  }
+
+  var key = (params.key || "").toString().trim();
+  if (!key) return jsonOutput({ success: false, error: "ต้องระบุ key" });
+
+  var valueJson = (params.value || "").toString();
+  var parsedValue;
+  try {
+    parsedValue = JSON.parse(valueJson);
+  } catch (e) {
+    return jsonOutput({ success: false, error: "ค่าที่บันทึกไม่ใช่ JSON ที่ถูกต้อง" });
+  }
+
+  var ss = getSpreadsheet();
+  var sheet = ss.getSheetByName(APP_CONFIG_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(APP_CONFIG_SHEET_NAME);
+    sheet.appendRow(["Key", "ValueJSON"]);
+  }
+
+  var data = sheet.getDataRange().getValues();
+  var rowIndex = -1;
+  for (var i = 1; i < data.length; i++) {
+    if ((data[i][0] || "").toString().trim() === key) {
+      rowIndex = i;
+      break;
+    }
+  }
+
+  if (rowIndex === -1) {
+    sheet.appendRow([key, valueJson]);
+  } else {
+    sheet.getRange(rowIndex + 1, 2).setValue(valueJson);
+  }
+
+  return jsonOutput({ success: true, key: key, value: parsedValue });
 }
