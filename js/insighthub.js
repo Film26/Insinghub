@@ -338,6 +338,291 @@ function getHubUniqueValues(colId) {
 // การยัดเป็น <li> ทั้งหมดทำให้ DOM บวมและหน่วง) พิมพ์ค้นหาเพื่อกรองตัวเลือกได้ตามปกติ
 const HUB_OPTION_RENDER_LIMIT = 500;
 
+// Builds (and caches) the customer-level aggregate array + available years from
+// raw order rows — collapses ~56k order rows into ~21k customers with LTV tier,
+// segment1/segment2, adminPriority, etc. Shared by the Customer InsightHub page
+// and the Dashboard page (js/dashboard.js) so both read identical numbers from
+// one computation.
+function buildInsightCustomers(rawData) {
+  // [PERF] แคชผลการยุบข้อมูล: raw ~56k แถว -> ลูกค้า ~21k ราย เป็นงานหนักที่สุดของหน้านี้
+  // เดิมถูกคำนวณใหม่ทุก interaction (เปิด dropdown, sort, เปลี่ยนหน้า ล้วนเรียก render ใหม่) ทำให้หน่วง
+  // -> คำนวณครั้งเดียวต่อชุดข้อมูล ส่วน sort/filter/แบ่งหน้าใช้ผลจากแคช (ข้อมูลใหม่/import ใหม่จะคำนวณใหม่เอง)
+  if (!window.__hubCache) window.__hubCache = { rawRef: null, rawLen: -1, customers: null, years: null, uniq: {} };
+  const hubCache = window.__hubCache;
+
+  if (hubCache.rawRef === rawData && hubCache.rawLen === rawData.length && hubCache.customers) {
+    return { customers: hubCache.customers, availableYears: hubCache.years };
+  }
+
+  // [RAW2021] กันพังกรณี window.isSaleOrder ไม่ถูกโหลด -> ถือว่าทุกแถวเป็น SALE
+  const isSaleRow = (row) => (typeof window.isSaleOrder === 'function' ? window.isSaleOrder(row) : true);
+
+  // [RAW2021] ตรวจรูปแบบไฟล์: RAW 2021 เป็น export รายการขายล้วน (มีคอลัมน์ Net Sales
+  // แต่ไม่มีคอลัมน์ประเภทเอกสาร/สถานะ) ถ้าปล่อยผ่าน isSaleOrder ของรูปแบบเดิม
+  // มันอาจกรองแถวทิ้งเพราะหาคอลัมน์ที่ใช้ตรวจไม่เจอ ทำให้ยอดขาย/จำนวนออเดอร์ "มาไม่ครบ"
+  // -> ไฟล์รูปแบบนี้ให้นับทุกแถวเป็นรายการขาย ส่วนไฟล์รูปแบบเดิมยังผ่าน isSaleOrder ตามปกติทุกอย่าง
+  const sampleRows = rawData.slice(0, 50);
+  const hasNetSalesCol = sampleRows.some(r => (window.getRowValue(r, ['Net Sales']) || '').toString().trim() !== '');
+  const hasDocTypeCol = sampleRows.some(r => (window.getRowValue(r, ['Order type', 'OrderType', 'ประเภทเอกสาร', 'ประเภท', 'สถานะ', 'DocType', 'Document Type', 'Status', 'Type']) || '').toString().trim() !== '');
+  const isRaw2021Format = hasNetSalesCol && !hasDocTypeCol;
+  const rawSaleOrders = isRaw2021Format ? rawData.slice() : rawData.filter(row => isSaleRow(row));
+
+  let maxTime = 0;
+  const availableYearsSet = new Set();
+
+  rawSaleOrders.forEach(row => {
+    const dateStr = window.getRowValue(row, ['วันที่สร้าง', 'วันที่โอนเงิน', 'OrderDate', 'Date', 'วันที่']);
+    const d = parseToDateObj(dateStr);
+    if (d) {
+      if (d.getTime() > maxTime) maxTime = d.getTime();
+      availableYearsSet.add(d.getFullYear());
+    }
+  });
+
+  const today = maxTime > 0 ? new Date(maxTime) : new Date();
+  const availableYears = Array.from(availableYearsSet).sort((a, b) => a - b);
+
+  const customerHistoryMap = {};
+
+  rawSaleOrders.forEach(row => {
+    const key = getCustomerKey(row); // [RAW2021] เดิมใช้ normalizePhone
+    if (!key) return;
+    if (!customerHistoryMap[key]) {
+      customerHistoryMap[key] = [];
+    }
+    customerHistoryMap[key].push(row);
+  });
+
+  // ประวัติออเดอร์ "ทุกประเภท" (ไม่กรองเฉพาะ SALE) ต่อลูกค้า ใช้คำนวณ FirstChannel/LastChannel
+  // ให้ตรงกับสูตรเดิมใน Google Sheets ที่ค้นหาจากชีต 'All Order_Inputs' ทั้งหมด
+  const allOrdersHistoryMap = {};
+  rawData.forEach(row => {
+    const key = getCustomerKey(row); // [RAW2021]
+    if (!key) return;
+    if (!allOrdersHistoryMap[key]) {
+      allOrdersHistoryMap[key] = [];
+    }
+    allOrdersHistoryMap[key].push(row);
+  });
+
+  const filteredCustomerKeys = new Set();
+  rawData.forEach(row => {
+    const key = getCustomerKey(row); // [RAW2021]
+    if (key) filteredCustomerKeys.add(key);
+  });
+
+  if (filteredCustomerKeys.size === 0) {
+    return { customers: [], availableYears };
+  }
+
+  const customers = Array.from(filteredCustomerKeys).map(custKey => {
+    const historyRows = customerHistoryMap[custKey] || [];
+    const sortedHistory = historyRows.map(row => {
+      const dateStr = window.getRowValue(row, ['วันที่สร้าง', 'วันที่โอนเงิน', 'OrderDate', 'Date', 'วันที่']);
+      return { row: row, dateObj: parseToDateObj(dateStr) };
+    }).filter(item => item.dateObj !== null).sort((a, b) => a.dateObj - b.dateObj);
+
+    if (sortedHistory.length === 0) return null;
+
+    const firstOrder = sortedHistory[0];
+    const lastOrder = sortedHistory[sortedHistory.length - 1];
+
+    const firstPurchaseDate = firstOrder.dateObj;
+    const lastPurchaseDate = lastOrder.dateObj;
+    const totalOrders = sortedHistory.length;
+
+    let totalRevenue = 0;
+    sortedHistory.forEach(o => {
+      const revStr = window.getRowValue(o.row, ['ยอดขาย', 'ราคาสินค้ายังไม่รวมภาษี', 'Net Sales', 'Revenue', 'Amount', 'ยอดโอน']) || '0';
+      const rev = parseFloat(revStr.replace(/,/g, ''));
+      if (!isNaN(rev)) totalRevenue += rev;
+    });
+
+    const aov = totalOrders > 0 ? totalRevenue / totalOrders : 0;
+    const diffTime = today - lastPurchaseDate;
+    const daysSinceLast = Math.max(0, diffTime / (1000 * 60 * 60 * 24));
+
+    const lastProductStr = window.getRowValue(lastOrder.row, ['Product Set', 'ชื่อสินค้า', 'Product', 'รายการขาย']) || "-";
+    const refillWindow = getRefillWindow(lastProductStr);
+    const nextPurchaseDateObj = new Date(lastPurchaseDate.getTime() + refillWindow * 24 * 60 * 60 * 1000);
+
+    let ltvTier = "🐚 4. General";
+    if (totalRevenue >= 25000) ltvTier = "💎 1. VVIP Whale (>25k)";
+    else if (totalRevenue >= 12000) ltvTier = "🐳 2. VIP Dolphin (>12k)";
+    else if (totalRevenue >= 4500) ltvTier = "🐟 3. Regular Minnow (>4.5k)";
+
+    const tenureDays = Math.max(0, (lastPurchaseDate - firstPurchaseDate) / (1000 * 60 * 60 * 24));
+    let loyaltyTier = "🌱 Seedling";
+    if (tenureDays > 365) loyaltyTier = "🏅 Legendary (1Y+)";
+    else if (tenureDays > 180) loyaltyTier = "🥈 Veteran (6M+)";
+    else if (tenureDays > 45) loyaltyTier = "🥉 Regular";
+
+    const entryProduct = window.getRowValue(firstOrder.row, ['Product Set', 'ชื่อสินค้า', 'Product', 'รายการขาย']) || "-";
+
+    const prodCounts = {};
+    sortedHistory.forEach(o => {
+      const p = window.getRowValue(o.row, ['Product Set', 'ชื่อสินค้า', 'Product', 'รายการขาย']);
+      if (p) prodCounts[p] = (prodCounts[p] || 0) + 1;
+    });
+    let currentFavorite = "-";
+    let maxC = 0;
+    for (const p in prodCounts) {
+      if (prodCounts[p] > maxC) {
+        maxC = prodCounts[p];
+        currentFavorite = p;
+      }
+    }
+
+    let segment1 = "CHURN";
+    if (daysSinceLast <= 30) segment1 = "NEW";
+    else if (daysSinceLast <= 90) segment1 = "ACTIVE";
+    else if (daysSinceLast <= 120) segment1 = "RISK";
+
+    let segment2 = "CHURN";
+    if (daysSinceLast <= 7) segment2 = "NEW";
+    else if (daysSinceLast <= refillWindow - 8) segment2 = "ACTIVE";
+    else if (daysSinceLast <= refillWindow + 3) segment2 = "REFILL";
+    else if (daysSinceLast <= refillWindow + 59) segment2 = "RISK";
+
+    // Wording note: the Thai parenthetical here is what shows to admins as the
+    // "sales opportunity" framing — keep the English High/Medium/Low/Win-back
+    // keyword intact since getAdminPriClass() and the Excel export match on it.
+    let adminPriority = "4. 🔴 Win-back (โอกาสดึงลูกค้ากลับ)";
+    if (segment2 === "REFILL") {
+      adminPriority = "1. 🟢 High (โอกาสสร้างยอดขาย)";
+    } else if (segment1 === "NEW" || segment2 === "NEW" || (segment1 === "RISK" && segment2 === "RISK")) {
+      adminPriority = "2. 🟡 Medium (สร้างความสัมพันธ์)";
+    } else if (
+      (segment1 === "ACTIVE" && segment2 === "ACTIVE") ||
+      ((segment1 === "RISK" || segment1 === "CHURN") && segment2 === "ACTIVE") ||
+      (segment1 === "ACTIVE" && segment2 === "RISK")
+    ) {
+      adminPriority = "3. 🟠 Low (ดูแลสัมพันธ์)";
+    }
+
+    let actionStrategy = "✅ Healthy Care: ดูแลตามปกติ";
+    if (segment1 === "ACTIVE" && segment2 === "REFILL") actionStrategy = "🎯 Golden Period: ทักปิดยอดด่วน!";
+    else if (segment1 === "RISK" && segment2 === "REFILL") actionStrategy = "⚡ Urgent Opportunity: ทักดึงกลับด้วยโปร";
+    else if (segment1 === "CHURN" && segment2 === "REFILL") actionStrategy = "🕒 Legacy Refill: ทักกระตุ้นรอบใหม่";
+    else if ((segment1 === "RISK" || segment1 === "CHURN") && segment2 === "ACTIVE") actionStrategy = "💎 High LTV: ลูกค้าเซ็ตใหญ่ (ห้ามตื๊อ)";
+    else if (segment1 === "RISK" && segment2 === "RISK") actionStrategy = "🟠 Risk Alert: ทักเสนอโปรดึงกลับ";
+    else if (segment1 === "NEW" && segment2 === "RISK") actionStrategy = "🟠 Risk Alert: ถามวิธีทาน/กระตุ้น/ความพอใจ";
+    else if (segment1 === "ACTIVE" && segment2 === "RISK") actionStrategy = "⚠️ Slow User: ทักถามวิธีทาน/กระตุ้น";
+    else if (segment1 === "ACTIVE" && segment2 === "CHURN") actionStrategy = "🚨 Speed Churn: ทักถามความพึงพอใจ";
+    else if (segment1 === "NEW" && segment2 === "NEW") actionStrategy = "💖 Welcome: ติดตามผล/สอนวิธีใช้";
+    else if ((segment1 === "RISK" || segment1 === "CHURN") && segment2 === "CHURN") actionStrategy = "😴 Dead Churn: ส่งโปรแรงดึงกลับ";
+
+    // FirstChannel = ช่องทางของออเดอร์แรกสุด (ทุกประเภท) ตามลำดับเวลา
+    // LastChannel = ช่องทางล่าสุดที่ "ไม่ว่าง" (ทุกประเภท)
+    // [RAW2021] เปลี่ยนจากอ่านคอลัมน์ ช่องทาง/Channel ตรงๆ เป็น getChannelRaw() ที่ fallback ไปแกะจาก Remark
+    const allOrdersSorted = (allOrdersHistoryMap[custKey] || []).map(row => {
+      const dateStr = window.getRowValue(row, ['วันที่สร้าง', 'วันที่โอนเงิน', 'OrderDate', 'Date', 'วันที่']);
+      return { row, dateObj: parseToDateObj(dateStr) };
+    }).filter(item => item.dateObj !== null).sort((a, b) => a.dateObj - b.dateObj);
+
+    let firstChannel = "-";
+    if (allOrdersSorted.length > 0) {
+      const stdFirst = getRowChannelStd(allOrdersSorted[0].row);
+      firstChannel = stdFirst.mainChannel || "-";
+    }
+
+    let lastChannel = "-";
+    for (let i = allOrdersSorted.length - 1; i >= 0; i--) {
+      const stdRow = getRowChannelStd(allOrdersSorted[i].row);
+      if (stdRow.subChannel || stdRow.mainChannel) { lastChannel = stdRow.subChannel || stdRow.mainChannel; break; }
+    }
+
+    let lastAdmin = "-";
+    if (window.getNormalizedAdmin) {
+      lastAdmin = window.getNormalizedAdmin(lastOrder.row);
+    } else {
+      lastAdmin = window.getRowValue(lastOrder.row, ['ชื่อแอดมิน', 'Admin', 'Admin Name']) || "-";
+    }
+    // ไม่มีชื่อแอดมิน (getNormalizedAdmin คืน 'Unknown' เป็นค่า default) -> แสดง "-" แทน
+    if (!lastAdmin || lastAdmin === 'Unknown') lastAdmin = "-";
+
+    // คำนวณยอดเงินสะสมจริงแยกรายปี + จำนวนออร์เดอร์ต่อปี (ใช้แสดงในโปรไฟล์ลูกค้า)
+    // [RAW2021] เพิ่ม 'Net Sales' ในลิสต์คอลัมน์ยอดขาย (เดิมมีแค่ ยอดขาย/ยอดโอน ทำให้ RAW 2021 ได้ 0 หมด)
+    const annualSpending = {};
+    const annualOrders = {};
+    availableYears.forEach(y => { annualSpending[y] = 0; annualOrders[y] = 0; });
+    sortedHistory.forEach(o => {
+      const year = o.dateObj.getFullYear();
+      if (annualSpending[year] !== undefined) {
+        const revStr = window.getRowValue(o.row, ['ยอดขาย', 'ยอดโอน', 'Net Sales', 'ราคาสินค้ายังไม่รวมภาษี', 'Revenue', 'Amount']) || '0';
+        const rev = parseFloat(revStr.replace(/,/g, ''));
+        if (!isNaN(rev)) annualSpending[year] += rev;
+        annualOrders[year] += 1;
+      }
+    });
+
+    // [RAW2021] เบอร์สำหรับ "แสดงผล" ในคอลัมน์ CustomerKey (Phone)
+    // - ไฟล์เดิม: custKey คือเบอร์อยู่แล้ว -> โชว์เหมือนเดิมเป๊ะ
+    // - RAW 2021: custKey เป็นรหัสลูกค้า (ใช้จับกลุ่มเบื้องหลัง) แต่หน้าจอโชว์เบอร์มาสก์ตามไฟล์ เช่น xxxxxxx429
+    const rawPhoneVal = (window.getRowValue(lastOrder.row, ['Phone', 'เบอร์โทร', 'เบอร์โทรศัพท์']) || '').toString().trim();
+    const normPhone = normalizePhone(rawPhoneVal);
+    const displayPhone = (custKey === normPhone) ? custKey : (normPhone || rawPhoneVal || custKey);
+
+    const customerObj = {
+      phone: custKey, // [RAW2021] property ชื่อเดิม ค่าคือคีย์จาก getCustomerKey (ไฟล์เดิม = เบอร์โทรเหมือนเดิม)
+      displayPhone,
+      name: window.getRowValue(lastOrder.row, ['CustomerName', 'ชื่อผู้ส่ง', 'Customer ID', 'รหัสลูกค้า']) || custKey,
+      firstPurchaseDate,
+      lastPurchaseDate,
+      totalOrders,
+      totalRevenue,
+      aov,
+      daysSinceLast,
+      lastProductStr,
+      nextPurchaseDateObj,
+      ltvTier,
+      loyaltyTier,
+      entryProduct,
+      currentFavorite,
+      adminPriority,
+      segment1,
+      segment2,
+      actionStrategy,
+      firstChannel,
+      lastChannel,
+      lastAdmin,
+      annualSpending,
+      annualOrders,
+      firstPurchaseStr: formatDateDisplay(firstPurchaseDate),
+      lastPurchaseStr: formatDateDisplay(lastPurchaseDate),
+      nextPurchaseStr: formatDateDisplay(nextPurchaseDateObj),
+      totalOrdersStr: String(totalOrders),
+      totalRevenueStr: "฿" + totalRevenue.toLocaleString(undefined, {maximumFractionDigits:0}),
+      aovStr: "฿" + aov.toLocaleString(undefined, {maximumFractionDigits:0}),
+      daysSinceLastStr: daysSinceLast.toFixed(1)
+    };
+
+    // ตั้งค่าแสดงผลบนตารางหน้าหลักเป็น ยอดเงินบาท
+    availableYears.forEach(y => {
+      const amt = annualSpending[y] || 0;
+      customerObj['tier' + y] = amt > 0 ? "฿" + amt.toLocaleString(undefined, {maximumFractionDigits:0}) : "-";
+    });
+
+    return customerObj;
+  }).filter(c => c !== null);
+
+  // [PERF] เก็บผลลงแคช + log ตัวเลขไว้ตรวจสอบ (เปิด Console ดูได้ว่าแถว/ยอดหายที่ขั้นไหน)
+  hubCache.rawRef = rawData;
+  hubCache.rawLen = rawData.length;
+  hubCache.customers = customers;
+  hubCache.years = availableYears;
+  hubCache.uniq = {};
+  console.info('[InsightHub] rows:', rawData.length,
+    '| sale rows:', rawSaleOrders.length,
+    '| isRaw2021Format:', isRaw2021Format,
+    '| customers:', customers.length,
+    '| total revenue:', customers.reduce((s, c) => s + c.totalRevenue, 0).toLocaleString());
+
+  return { customers, availableYears };
+}
+window.buildInsightCustomers = buildInsightCustomers;
+window.getAnnualTier = getAnnualTier; // exposed for js/dashboard.js's Customer Tier Distribution donut
+
 function renderInsightHub(filteredData, rawData) {
   const container = document.getElementById('view-insighthub');
   // แก้ปัญหาหน้าเด้งกลับขึ้นบนสุดทุกครั้งที่เปลี่ยนหน้า/กรอง/เรียงลำดับ (ทุกอย่างวนกลับมาเรียกฟังก์ชันนี้ใหม่
@@ -760,283 +1045,13 @@ function renderInsightHub(filteredData, rawData) {
 
   const state = window.insightHubState;
 
-  // [PERF] แคชผลการยุบข้อมูล: raw ~56k แถว -> ลูกค้า ~21k ราย เป็นงานหนักที่สุดของหน้านี้
-  // เดิมถูกคำนวณใหม่ทุก interaction (เปิด dropdown, sort, เปลี่ยนหน้า ล้วนเรียก render ใหม่) ทำให้หน่วง
-  // -> คำนวณครั้งเดียวต่อชุดข้อมูล ส่วน sort/filter/แบ่งหน้าใช้ผลจากแคช (ข้อมูลใหม่/import ใหม่จะคำนวณใหม่เอง)
-  if (!window.__hubCache) window.__hubCache = { rawRef: null, rawLen: -1, customers: null, years: null, uniq: {} };
-  const hubCache = window.__hubCache;
-
-  let customers, availableYears;
-  if (hubCache.rawRef === rawData && hubCache.rawLen === rawData.length && hubCache.customers) {
-    customers = hubCache.customers;
-    availableYears = hubCache.years;
-    window.insightHubState.availableYears = availableYears;
-  } else {
-
-  // [RAW2021] กันพังกรณี window.isSaleOrder ไม่ถูกโหลด -> ถือว่าทุกแถวเป็น SALE
-  const isSaleRow = (row) => (typeof window.isSaleOrder === 'function' ? window.isSaleOrder(row) : true);
-
-  // [RAW2021] ตรวจรูปแบบไฟล์: RAW 2021 เป็น export รายการขายล้วน (มีคอลัมน์ Net Sales
-  // แต่ไม่มีคอลัมน์ประเภทเอกสาร/สถานะ) ถ้าปล่อยผ่าน isSaleOrder ของรูปแบบเดิม
-  // มันอาจกรองแถวทิ้งเพราะหาคอลัมน์ที่ใช้ตรวจไม่เจอ ทำให้ยอดขาย/จำนวนออเดอร์ "มาไม่ครบ"
-  // -> ไฟล์รูปแบบนี้ให้นับทุกแถวเป็นรายการขาย ส่วนไฟล์รูปแบบเดิมยังผ่าน isSaleOrder ตามปกติทุกอย่าง
-  const sampleRows = rawData.slice(0, 50);
-  const hasNetSalesCol = sampleRows.some(r => (window.getRowValue(r, ['Net Sales']) || '').toString().trim() !== '');
-  const hasDocTypeCol = sampleRows.some(r => (window.getRowValue(r, ['Order type', 'OrderType', 'ประเภทเอกสาร', 'ประเภท', 'สถานะ', 'DocType', 'Document Type', 'Status', 'Type']) || '').toString().trim() !== '');
-  const isRaw2021Format = hasNetSalesCol && !hasDocTypeCol;
-  const rawSaleOrders = isRaw2021Format ? rawData.slice() : rawData.filter(row => isSaleRow(row));
-  
-  let maxTime = 0;
-  const availableYearsSet = new Set();
-  
-  rawSaleOrders.forEach(row => {
-    const dateStr = window.getRowValue(row, ['วันที่สร้าง', 'วันที่โอนเงิน', 'OrderDate', 'Date', 'วันที่']);
-    const d = parseToDateObj(dateStr);
-    if (d) {
-      if (d.getTime() > maxTime) maxTime = d.getTime();
-      availableYearsSet.add(d.getFullYear());
-    }
-  });
-  
-  const today = maxTime > 0 ? new Date(maxTime) : new Date();
-  availableYears = Array.from(availableYearsSet).sort((a, b) => a - b);
+  const { customers, availableYears } = window.buildInsightCustomers(rawData);
   window.insightHubState.availableYears = availableYears;
 
-  const customerHistoryMap = {};
-
-  rawSaleOrders.forEach(row => {
-    const key = getCustomerKey(row); // [RAW2021] เดิมใช้ normalizePhone
-    if (!key) return;
-    if (!customerHistoryMap[key]) {
-      customerHistoryMap[key] = [];
-    }
-    customerHistoryMap[key].push(row);
-  });
-
-  // ประวัติออเดอร์ "ทุกประเภท" (ไม่กรองเฉพาะ SALE) ต่อลูกค้า ใช้คำนวณ FirstChannel/LastChannel
-  // ให้ตรงกับสูตรเดิมใน Google Sheets ที่ค้นหาจากชีต 'All Order_Inputs' ทั้งหมด
-  const allOrdersHistoryMap = {};
-  rawData.forEach(row => {
-    const key = getCustomerKey(row); // [RAW2021]
-    if (!key) return;
-    if (!allOrdersHistoryMap[key]) {
-      allOrdersHistoryMap[key] = [];
-    }
-    allOrdersHistoryMap[key].push(row);
-  });
-
-  const filteredCustomerKeys = new Set();
-  rawData.forEach(row => {
-    const key = getCustomerKey(row); // [RAW2021]
-    if (key) filteredCustomerKeys.add(key);
-  });
-
-  if (filteredCustomerKeys.size === 0) {
+  if (customers.length === 0) {
     container.innerHTML = '<div style="text-align:center; padding:50px; color:#999;">No customers found matching the filters.</div>';
     return;
   }
-
-  customers = Array.from(filteredCustomerKeys).map(custKey => {
-    const historyRows = customerHistoryMap[custKey] || [];
-    const sortedHistory = historyRows.map(row => {
-      const dateStr = window.getRowValue(row, ['วันที่สร้าง', 'วันที่โอนเงิน', 'OrderDate', 'Date', 'วันที่']);
-      return { row: row, dateObj: parseToDateObj(dateStr) };
-    }).filter(item => item.dateObj !== null).sort((a, b) => a.dateObj - b.dateObj);
-
-    if (sortedHistory.length === 0) return null;
-
-    const firstOrder = sortedHistory[0];
-    const lastOrder = sortedHistory[sortedHistory.length - 1];
-    
-    const firstPurchaseDate = firstOrder.dateObj;
-    const lastPurchaseDate = lastOrder.dateObj;
-    const totalOrders = sortedHistory.length;
-    
-    let totalRevenue = 0;
-    sortedHistory.forEach(o => {
-      const revStr = window.getRowValue(o.row, ['ยอดขาย', 'ราคาสินค้ายังไม่รวมภาษี', 'Net Sales', 'Revenue', 'Amount', 'ยอดโอน']) || '0';
-      const rev = parseFloat(revStr.replace(/,/g, ''));
-      if (!isNaN(rev)) totalRevenue += rev;
-    });
-
-    const aov = totalOrders > 0 ? totalRevenue / totalOrders : 0;
-    const diffTime = today - lastPurchaseDate;
-    const daysSinceLast = Math.max(0, diffTime / (1000 * 60 * 60 * 24));
-    
-    const lastProductStr = window.getRowValue(lastOrder.row, ['Product Set', 'ชื่อสินค้า', 'Product', 'รายการขาย']) || "-";
-    const refillWindow = getRefillWindow(lastProductStr);
-    const nextPurchaseDateObj = new Date(lastPurchaseDate.getTime() + refillWindow * 24 * 60 * 60 * 1000);
-
-    let ltvTier = "🐚 4. General";
-    if (totalRevenue >= 25000) ltvTier = "💎 1. VVIP Whale (>25k)";
-    else if (totalRevenue >= 12000) ltvTier = "🐳 2. VIP Dolphin (>12k)";
-    else if (totalRevenue >= 4500) ltvTier = "🐟 3. Regular Minnow (>4.5k)";
-
-    const tenureDays = Math.max(0, (lastPurchaseDate - firstPurchaseDate) / (1000 * 60 * 60 * 24));
-    let loyaltyTier = "🌱 Seedling";
-    if (tenureDays > 365) loyaltyTier = "🏅 Legendary (1Y+)";
-    else if (tenureDays > 180) loyaltyTier = "🥈 Veteran (6M+)";
-    else if (tenureDays > 45) loyaltyTier = "🥉 Regular";
-
-    const entryProduct = window.getRowValue(firstOrder.row, ['Product Set', 'ชื่อสินค้า', 'Product', 'รายการขาย']) || "-";
-    
-    const prodCounts = {};
-    sortedHistory.forEach(o => {
-      const p = window.getRowValue(o.row, ['Product Set', 'ชื่อสินค้า', 'Product', 'รายการขาย']);
-      if (p) prodCounts[p] = (prodCounts[p] || 0) + 1;
-    });
-    let currentFavorite = "-";
-    let maxC = 0;
-    for (const p in prodCounts) {
-      if (prodCounts[p] > maxC) {
-        maxC = prodCounts[p];
-        currentFavorite = p;
-      }
-    }
-
-    let segment1 = "CHURN";
-    if (daysSinceLast <= 30) segment1 = "NEW";
-    else if (daysSinceLast <= 90) segment1 = "ACTIVE";
-    else if (daysSinceLast <= 120) segment1 = "RISK";
-
-    let segment2 = "CHURN";
-    if (daysSinceLast <= 7) segment2 = "NEW";
-    else if (daysSinceLast <= refillWindow - 8) segment2 = "ACTIVE";
-    else if (daysSinceLast <= refillWindow + 3) segment2 = "REFILL";
-    else if (daysSinceLast <= refillWindow + 59) segment2 = "RISK";
-
-    let adminPriority = "4. 🔴 Win-back (กู้สถานะ)";
-    if (segment2 === "REFILL") {
-      adminPriority = "1. 🟢 High (ยอดขาย)";
-    } else if (segment1 === "NEW" || segment2 === "NEW" || (segment1 === "RISK" && segment2 === "RISK")) {
-      adminPriority = "2. 🟡 Medium (สร้างใจ)";
-    } else if (
-      (segment1 === "ACTIVE" && segment2 === "ACTIVE") ||
-      ((segment1 === "RISK" || segment1 === "CHURN") && segment2 === "ACTIVE") ||
-      (segment1 === "ACTIVE" && segment2 === "RISK")
-    ) {
-      adminPriority = "3. 🟠 Low (ดูแลสัมพันธ์)";
-    }
-
-    let actionStrategy = "✅ Healthy Care: ดูแลตามปกติ";
-    if (segment1 === "ACTIVE" && segment2 === "REFILL") actionStrategy = "🎯 Golden Period: ทักปิดยอดด่วน!";
-    else if (segment1 === "RISK" && segment2 === "REFILL") actionStrategy = "⚡ Urgent Opportunity: ทักดึงกลับด้วยโปร";
-    else if (segment1 === "CHURN" && segment2 === "REFILL") actionStrategy = "🕒 Legacy Refill: ทักกระตุ้นรอบใหม่";
-    else if ((segment1 === "RISK" || segment1 === "CHURN") && segment2 === "ACTIVE") actionStrategy = "💎 High LTV: ลูกค้าเซ็ตใหญ่ (ห้ามตื๊อ)";
-    else if (segment1 === "RISK" && segment2 === "RISK") actionStrategy = "🟠 Risk Alert: ทักเสนอโปรดึงกลับ";
-    else if (segment1 === "NEW" && segment2 === "RISK") actionStrategy = "🟠 Risk Alert: ถามวิธีทาน/กระตุ้น/ความพอใจ";
-    else if (segment1 === "ACTIVE" && segment2 === "RISK") actionStrategy = "⚠️ Slow User: ทักถามวิธีทาน/กระตุ้น";
-    else if (segment1 === "ACTIVE" && segment2 === "CHURN") actionStrategy = "🚨 Speed Churn: ทักถามความพึงพอใจ";
-    else if (segment1 === "NEW" && segment2 === "NEW") actionStrategy = "💖 Welcome: ติดตามผล/สอนวิธีใช้";
-    else if ((segment1 === "RISK" || segment1 === "CHURN") && segment2 === "CHURN") actionStrategy = "😴 Dead Churn: ส่งโปรแรงดึงกลับ";
-
-    // FirstChannel = ช่องทางของออเดอร์แรกสุด (ทุกประเภท) ตามลำดับเวลา
-    // LastChannel = ช่องทางล่าสุดที่ "ไม่ว่าง" (ทุกประเภท)
-    // [RAW2021] เปลี่ยนจากอ่านคอลัมน์ ช่องทาง/Channel ตรงๆ เป็น getChannelRaw() ที่ fallback ไปแกะจาก Remark
-    const allOrdersSorted = (allOrdersHistoryMap[custKey] || []).map(row => {
-      const dateStr = window.getRowValue(row, ['วันที่สร้าง', 'วันที่โอนเงิน', 'OrderDate', 'Date', 'วันที่']);
-      return { row, dateObj: parseToDateObj(dateStr) };
-    }).filter(item => item.dateObj !== null).sort((a, b) => a.dateObj - b.dateObj);
-
-    let firstChannel = "-";
-    if (allOrdersSorted.length > 0) {
-      const stdFirst = getRowChannelStd(allOrdersSorted[0].row);
-      firstChannel = stdFirst.mainChannel || "-";
-    }
-
-    let lastChannel = "-";
-    for (let i = allOrdersSorted.length - 1; i >= 0; i--) {
-      const stdRow = getRowChannelStd(allOrdersSorted[i].row);
-      if (stdRow.subChannel || stdRow.mainChannel) { lastChannel = stdRow.subChannel || stdRow.mainChannel; break; }
-    }
-    
-    let lastAdmin = "-";
-    if (window.getNormalizedAdmin) {
-      lastAdmin = window.getNormalizedAdmin(lastOrder.row);
-    } else {
-      lastAdmin = window.getRowValue(lastOrder.row, ['ชื่อแอดมิน', 'Admin', 'Admin Name']) || "-";
-    }
-    // ไม่มีชื่อแอดมิน (getNormalizedAdmin คืน 'Unknown' เป็นค่า default) -> แสดง "-" แทน
-    if (!lastAdmin || lastAdmin === 'Unknown') lastAdmin = "-";
-
-    // คำนวณยอดเงินสะสมจริงแยกรายปี + จำนวนออร์เดอร์ต่อปี (ใช้แสดงในโปรไฟล์ลูกค้า)
-    // [RAW2021] เพิ่ม 'Net Sales' ในลิสต์คอลัมน์ยอดขาย (เดิมมีแค่ ยอดขาย/ยอดโอน ทำให้ RAW 2021 ได้ 0 หมด)
-    const annualSpending = {};
-    const annualOrders = {};
-    availableYears.forEach(y => { annualSpending[y] = 0; annualOrders[y] = 0; });
-    sortedHistory.forEach(o => {
-      const year = o.dateObj.getFullYear();
-      if (annualSpending[year] !== undefined) {
-        const revStr = window.getRowValue(o.row, ['ยอดขาย', 'ยอดโอน', 'Net Sales', 'ราคาสินค้ายังไม่รวมภาษี', 'Revenue', 'Amount']) || '0';
-        const rev = parseFloat(revStr.replace(/,/g, ''));
-        if (!isNaN(rev)) annualSpending[year] += rev;
-        annualOrders[year] += 1;
-      }
-    });
-
-    // [RAW2021] เบอร์สำหรับ "แสดงผล" ในคอลัมน์ CustomerKey (Phone)
-    // - ไฟล์เดิม: custKey คือเบอร์อยู่แล้ว -> โชว์เหมือนเดิมเป๊ะ
-    // - RAW 2021: custKey เป็นรหัสลูกค้า (ใช้จับกลุ่มเบื้องหลัง) แต่หน้าจอโชว์เบอร์มาสก์ตามไฟล์ เช่น xxxxxxx429
-    const rawPhoneVal = (window.getRowValue(lastOrder.row, ['Phone', 'เบอร์โทร', 'เบอร์โทรศัพท์']) || '').toString().trim();
-    const normPhone = normalizePhone(rawPhoneVal);
-    const displayPhone = (custKey === normPhone) ? custKey : (normPhone || rawPhoneVal || custKey);
-
-    const customerObj = {
-      phone: custKey, // [RAW2021] property ชื่อเดิม ค่าคือคีย์จาก getCustomerKey (ไฟล์เดิม = เบอร์โทรเหมือนเดิม)
-      displayPhone,
-      name: window.getRowValue(lastOrder.row, ['CustomerName', 'ชื่อผู้ส่ง', 'Customer ID', 'รหัสลูกค้า']) || custKey,
-      firstPurchaseDate,
-      lastPurchaseDate,
-      totalOrders,
-      totalRevenue,
-      aov,
-      daysSinceLast,
-      lastProductStr,
-      nextPurchaseDateObj,
-      ltvTier,
-      loyaltyTier,
-      entryProduct,
-      currentFavorite,
-      adminPriority,
-      segment1,
-      segment2,
-      actionStrategy,
-      firstChannel,
-      lastChannel,
-      lastAdmin,
-      annualSpending,
-      annualOrders,
-      firstPurchaseStr: formatDateDisplay(firstPurchaseDate),
-      lastPurchaseStr: formatDateDisplay(lastPurchaseDate),
-      nextPurchaseStr: formatDateDisplay(nextPurchaseDateObj),
-      totalOrdersStr: String(totalOrders),
-      totalRevenueStr: "฿" + totalRevenue.toLocaleString(undefined, {maximumFractionDigits:0}),
-      aovStr: "฿" + aov.toLocaleString(undefined, {maximumFractionDigits:0}),
-      daysSinceLastStr: daysSinceLast.toFixed(1)
-    };
-    
-    // ตั้งค่าแสดงผลบนตารางหน้าหลักเป็น ยอดเงินบาท
-    availableYears.forEach(y => {
-      const amt = annualSpending[y] || 0;
-      customerObj['tier' + y] = amt > 0 ? "฿" + amt.toLocaleString(undefined, {maximumFractionDigits:0}) : "-";
-    });
-    
-    return customerObj;
-  }).filter(c => c !== null);
-
-  // [PERF] เก็บผลลงแคช + log ตัวเลขไว้ตรวจสอบ (เปิด Console ดูได้ว่าแถว/ยอดหายที่ขั้นไหน)
-  hubCache.rawRef = rawData;
-  hubCache.rawLen = rawData.length;
-  hubCache.customers = customers;
-  hubCache.years = availableYears;
-  hubCache.uniq = {};
-  console.info('[InsightHub] rows:', rawData.length,
-    '| sale rows:', rawSaleOrders.length,
-    '| isRaw2021Format:', isRaw2021Format,
-    '| customers:', customers.length,
-    '| total revenue:', customers.reduce((s, c) => s + c.totalRevenue, 0).toLocaleString());
-
-  } // end: cache miss (คำนวณใหม่)
 
   window.insightHubState.allCustomers = customers;
 
