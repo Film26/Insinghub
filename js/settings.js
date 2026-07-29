@@ -96,6 +96,85 @@ function renderSettingsView() {
     `
     : "";
 
+  // Advanced config: Loyalty Index thresholds, Admin Priority x Segment
+  // matrix, Trend Visual thresholds, refill buffer — all backed by the
+  // generic Config_App sheet (see apps-script/Code.gs handleGetAppConfig).
+  const appConfig = window.AppData.appConfig || window.DEFAULT_APP_CONFIG;
+  const SEGMENT1_KEYS = ["NEW", "ACTIVE", "RISK", "CHURN"];
+  const SEGMENT2_KEYS = ["NEW", "ACTIVE", "REFILL", "RISK", "CHURN"];
+  const PRIORITY_LEVELS = ["High", "Medium", "Low", "Win-back"];
+  const advancedConfigCardHtml = canEditStatusOptions
+    ? `
+      <div class="settings-card" style="grid-column: 1 / -1;">
+        <h3><i class="fas fa-sliders"></i> ตั้งค่าเงื่อนไขระบบ (Advanced Config)</h3>
+
+        <div style="margin-bottom:20px;">
+          <h4 style="font-size:13px; margin:0 0 8px 0;">Loyalty Index (จำนวนวันสะสม)</h4>
+          <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:10px;">
+            <label style="font-size:11px; color:#64748b;">Seedling ถึง (วัน)
+              <input type="number" id="cfg-loyalty-seedling" value="${appConfig.loyaltyIndex.seedlingMaxDays}" min="0" style="width:100%; margin-top:4px;">
+            </label>
+            <label style="font-size:11px; color:#64748b;">Regular ถึง (วัน)
+              <input type="number" id="cfg-loyalty-regular" value="${appConfig.loyaltyIndex.regularMaxDays}" min="0" style="width:100%; margin-top:4px;">
+            </label>
+            <label style="font-size:11px; color:#64748b;">Veteran ถึง (วัน)
+              <input type="number" id="cfg-loyalty-veteran" value="${appConfig.loyaltyIndex.veteranMaxDays}" min="0" style="width:100%; margin-top:4px;">
+            </label>
+          </div>
+          <button class="btn btn-secondary" id="cfg-loyalty-save-btn"><i class="fas fa-save"></i> บันทึก Loyalty Index</button>
+        </div>
+
+        <div style="margin-bottom:20px; border-top:1px dashed #e2e8f0; padding-top:16px;">
+          <h4 style="font-size:13px; margin:0 0 8px 0;">Admin Priority × Segment</h4>
+          <p class="text-muted" style="font-size:11.5px; margin-top:-4px;">แถว = Segment 1 (Standard Period), คอลัมน์ = Segment 2 (Dynamic Refill)</p>
+          <div style="overflow-x:auto;">
+            <table class="overview-table" style="min-width:560px;">
+              <thead><tr><th></th>${SEGMENT2_KEYS.map((s2) => `<th>${s2}</th>`).join("")}</tr></thead>
+              <tbody>
+                ${SEGMENT1_KEYS.map(
+                  (s1) => `
+                  <tr>
+                    <td style="font-weight:600;">${s1}</td>
+                    ${SEGMENT2_KEYS.map((s2) => {
+                      const key = s1 + "|" + s2;
+                      const val = appConfig.adminPriorityMatrix[key] || "Win-back";
+                      return `<td><select class="cfg-priority-cell" data-key="${key}">
+                        ${PRIORITY_LEVELS.map((lvl) => `<option value="${lvl}" ${lvl === val ? "selected" : ""}>${lvl}</option>`).join("")}
+                      </select></td>`;
+                    }).join("")}
+                  </tr>
+                `
+                ).join("")}
+              </tbody>
+            </table>
+          </div>
+          <button class="btn btn-secondary" id="cfg-priority-save-btn" style="margin-top:10px;"><i class="fas fa-save"></i> บันทึก Admin Priority</button>
+        </div>
+
+        <div style="margin-bottom:20px; border-top:1px dashed #e2e8f0; padding-top:16px;">
+          <h4 style="font-size:13px; margin:0 0 8px 0;">Trend Visual</h4>
+          <div style="display:flex; gap:20px; align-items:end; flex-wrap:wrap; margin-bottom:10px;">
+            <label style="font-size:11px; color:#64748b;">Neutral band (%)
+              <input type="number" id="cfg-trend-band" value="${appConfig.trendVisual.neutralBandPercent}" min="0" step="0.5" style="width:100px; display:block; margin-top:4px;">
+            </label>
+            <label style="font-size:12px; color:#334155; display:flex; align-items:center; gap:6px;">
+              <input type="checkbox" id="cfg-trend-interpolate" ${appConfig.trendVisual.interpolateCurrentYear ? "checked" : ""}>
+              Interpolate ปีปัจจุบันที่ยังไม่ครบปี
+            </label>
+          </div>
+          <button class="btn btn-secondary" id="cfg-trend-save-btn"><i class="fas fa-save"></i> บันทึก Trend Visual</button>
+        </div>
+
+        <div style="border-top:1px dashed #e2e8f0; padding-top:16px;">
+          <h4 style="font-size:13px; margin:0 0 8px 0;">Refill Buffer</h4>
+          <p class="text-muted" style="font-size:11.5px; margin-top:-4px;">ตัวคูณรอบเติมสินค้าที่คาดการณ์ (ค่าเริ่มต้น 1.1)</p>
+          <input type="number" id="cfg-refill-buffer" value="${appConfig.refillBuffer}" min="1" step="0.05" style="width:100px; margin-bottom:10px; display:block;">
+          <button class="btn btn-secondary" id="cfg-refill-save-btn"><i class="fas fa-save"></i> บันทึก Refill Buffer</button>
+        </div>
+      </div>
+    `
+    : "";
+
   container.innerHTML = `
     <div class="settings-grid">
       ${connectionCardHtml}
@@ -153,6 +232,7 @@ function renderSettingsView() {
 
       ${userMgmtCardHtml}
       ${statusOptionsCardHtml}
+      ${advancedConfigCardHtml}
     </div>
   `;
 
@@ -183,6 +263,7 @@ function renderSettingsView() {
 
   if (canEditStatusOptions) {
     wireStatusOptionsCard(session);
+    wireAdvancedConfigCard(session);
   }
 
   document.getElementById("settings-logout-btn").addEventListener("click", () => {
@@ -404,6 +485,63 @@ function wireStatusOptionsCard(session) {
     } catch (err) {
       window.showToast("บันทึกไม่สำเร็จ: " + err.message, "error");
     }
+  });
+}
+
+// Each of the 4 sub-sections (Loyalty Index, Admin Priority matrix, Trend
+// Visual, Refill Buffer) saves independently via the generic
+// CrmApi.saveAppConfig(requestUser, key, valueObj) — same Config_App sheet,
+// one row per key (see apps-script/Code.gs). Updates window.AppData.appConfig
+// in place + re-renders so buildInsightCustomers picks up the new values
+// immediately without a full page reload.
+function wireAdvancedConfigCard(session) {
+  const loyaltySaveBtn = document.getElementById("cfg-loyalty-save-btn");
+  if (!loyaltySaveBtn) return; // card not rendered (not permitted)
+
+  async function saveConfig(key, value, label, btn) {
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    try {
+      await window.CrmApi.saveAppConfig(session.username, key, value);
+      window.AppData.appConfig[key] = value;
+      window.showToast("บันทึก " + label + " แล้ว", "success");
+      if (window.applyFilters) window.applyFilters();
+    } catch (err) {
+      window.showToast("บันทึกไม่สำเร็จ: " + err.message, "error");
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = original;
+    }
+  }
+
+  loyaltySaveBtn.addEventListener("click", () => {
+    const value = {
+      seedlingMaxDays: parseInt(document.getElementById("cfg-loyalty-seedling").value, 10) || 45,
+      regularMaxDays: parseInt(document.getElementById("cfg-loyalty-regular").value, 10) || 180,
+      veteranMaxDays: parseInt(document.getElementById("cfg-loyalty-veteran").value, 10) || 365,
+    };
+    saveConfig("loyaltyIndex", value, "Loyalty Index", loyaltySaveBtn);
+  });
+
+  document.getElementById("cfg-priority-save-btn").addEventListener("click", (e) => {
+    const matrix = {};
+    document.querySelectorAll(".cfg-priority-cell").forEach((sel) => {
+      matrix[sel.dataset.key] = sel.value;
+    });
+    saveConfig("adminPriorityMatrix", matrix, "Admin Priority", e.currentTarget);
+  });
+
+  document.getElementById("cfg-trend-save-btn").addEventListener("click", (e) => {
+    const value = {
+      neutralBandPercent: parseFloat(document.getElementById("cfg-trend-band").value) || 0,
+      interpolateCurrentYear: document.getElementById("cfg-trend-interpolate").checked,
+    };
+    saveConfig("trendVisual", value, "Trend Visual", e.currentTarget);
+  });
+
+  document.getElementById("cfg-refill-save-btn").addEventListener("click", (e) => {
+    const value = parseFloat(document.getElementById("cfg-refill-buffer").value) || 1.1;
+    saveConfig("refillBuffer", value, "Refill Buffer", e.currentTarget);
   });
 }
 
