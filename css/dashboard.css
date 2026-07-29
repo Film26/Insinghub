@@ -175,11 +175,32 @@
   .overview-kpi-grid { grid-template-columns: 1fr; }
 }
 .overview-kpi-card {
+  display: flex;
+  flex-direction: column;
+  min-height: 108px;
   background: #fff;
   border: 1px solid #f0e6df;
   border-radius: 16px;
-  padding: 20px;
+  padding: 18px 20px;
   box-shadow: 0 4px 15px rgba(0, 0, 0, 0.02);
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+.overview-kpi-card:hover {
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.05);
+  transform: translateY(-1px);
+}
+.overview-kpi-card .icon {
+  align-self: flex-end;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: #fdf1e6;
+  color: #d95f1d;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  margin-bottom: 12px;
 }
 .overview-kpi-card .lbl {
   font-size: 11.5px;
@@ -193,18 +214,14 @@
   font-size: 26px;
   font-weight: 700;
   color: #0f172a;
+  line-height: 1.2;
+  margin-top: auto; /* keeps values baseline-aligned across a row even when labels wrap differently */
 }
-.overview-kpi-card .icon {
-  float: right;
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  background: #fdf1e6;
+.overview-kpi-card .pct {
+  font-size: 11.5px;
+  font-weight: 700;
   color: #d95f1d;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
+  margin-top: 4px;
 }
 
 .overview-section {
@@ -214,6 +231,10 @@
   padding: 20px 24px;
   margin-bottom: 24px;
   box-shadow: 0 4px 15px rgba(0, 0, 0, 0.02);
+  transition: box-shadow 0.15s ease;
+}
+.overview-section:hover {
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.035);
 }
 .overview-section h3 {
   font-size: 14px;
@@ -224,6 +245,89 @@
   margin: 0 0 16px 0;
   border-bottom: 1px solid #eee;
   padding-bottom: 10px;
+}
+.overview-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  border-bottom: 1px solid #eee;
+  padding-bottom: 10px;
+  margin-bottom: 16px;
+}
+.overview-section-header h3 {
+  margin: 0;
+  border: none;
+  padding: 0;
+}
+.trend-year-select {
+  padding: 7px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #334155;
+  background: #fff;
+}
+
+/* Customer Tier Distribution donut (Team Report) */
+.tier-donut-row {
+  display: flex;
+  align-items: center;
+  gap: 30px;
+  flex-wrap: wrap;
+}
+.tier-donut-canvas-wrap {
+  position: relative;
+  width: 260px;
+  height: 260px;
+  flex-shrink: 0;
+}
+.tier-legend {
+  flex-grow: 1;
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.tier-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  padding: 6px 0;
+  border-bottom: 1px solid #f8fafc;
+}
+.tier-legend-row:last-child {
+  border-bottom: none;
+}
+.tier-legend-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tier-legend-name {
+  font-weight: 600;
+  color: #334155;
+  flex-grow: 1;
+}
+.tier-legend-count {
+  font-weight: 700;
+  color: #0f172a;
+}
+.tier-legend-pct {
+  min-width: 52px;
+  text-align: right;
+  color: #7a665e;
+  font-weight: 600;
+}
+
+/* Sales Trend line chart (Individual Admin Report) */
+.trend-chart-wrap {
+  position: relative;
+  height: 280px;
 }
 .overview-table {
   width: 100%;
