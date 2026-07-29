@@ -14,6 +14,17 @@ if (!window.insightHubState) {
   };
 }
 
+// Full display strings for each Admin Priority level (Config_App >
+// adminPriorityMatrix picks the level per segment1|segment2 combo; this maps
+// that level to the wording shown in the UI). Keep the English keyword intact
+// — getAdminPriClass() and the Excel export match on it via .includes().
+const ADMIN_PRIORITY_LABELS = {
+  High: "1. 🟢 High (โอกาสสร้างยอดขาย)",
+  Medium: "2. 🟡 Medium (สร้างความสัมพันธ์)",
+  Low: "3. 🟠 Low (ดูแลสัมพันธ์)",
+  "Win-back": "4. 🔴 Win-back (โอกาสดึงลูกค้ากลับ)",
+};
+
 // Product Refill Window Day lookup from Config_Product_Refill sheet
 const productConfig = {
   "COLLAGEN = 3": 21,
@@ -59,8 +70,17 @@ function getProductDays(prodName) {
   return productConfig[key] !== undefined ? productConfig[key] : 30;
 }
 
+// Config_App > refillBuffer (default 1.1, editable in Settings): multiplies
+// the raw product refill-cycle days to add slack before flagging a customer
+// as due for a refill nudge.
+function getRefillBuffer() {
+  const cfg = window.AppData && window.AppData.appConfig;
+  const buffer = cfg && cfg.refillBuffer;
+  return (typeof buffer === 'number' && buffer > 0) ? buffer : 1.1;
+}
+
 function getRefillWindow(prodStr) {
-  if (!prodStr) return 30;
+  if (!prodStr) return Math.round(30 * getRefillBuffer());
   const parts = prodStr.split('|');
   let maxDays = 30;
   parts.forEach(p => {
@@ -69,7 +89,7 @@ function getRefillWindow(prodStr) {
       maxDays = d;
     }
   });
-  return maxDays;
+  return Math.round(maxDays * getRefillBuffer());
 }
 
 function parseToDateObj(dateStr) {
@@ -347,11 +367,11 @@ function buildInsightCustomers(rawData) {
   // [PERF] แคชผลการยุบข้อมูล: raw ~56k แถว -> ลูกค้า ~21k ราย เป็นงานหนักที่สุดของหน้านี้
   // เดิมถูกคำนวณใหม่ทุก interaction (เปิด dropdown, sort, เปลี่ยนหน้า ล้วนเรียก render ใหม่) ทำให้หน่วง
   // -> คำนวณครั้งเดียวต่อชุดข้อมูล ส่วน sort/filter/แบ่งหน้าใช้ผลจากแคช (ข้อมูลใหม่/import ใหม่จะคำนวณใหม่เอง)
-  if (!window.__hubCache) window.__hubCache = { rawRef: null, rawLen: -1, customers: null, years: null, uniq: {} };
+  if (!window.__hubCache) window.__hubCache = { rawRef: null, rawLen: -1, customers: null, years: null, today: null, uniq: {} };
   const hubCache = window.__hubCache;
 
   if (hubCache.rawRef === rawData && hubCache.rawLen === rawData.length && hubCache.customers) {
-    return { customers: hubCache.customers, availableYears: hubCache.years };
+    return { customers: hubCache.customers, availableYears: hubCache.years, today: hubCache.today };
   }
 
   // [RAW2021] กันพังกรณี window.isSaleOrder ไม่ถูกโหลด -> ถือว่าทุกแถวเป็น SALE
@@ -412,8 +432,12 @@ function buildInsightCustomers(rawData) {
   });
 
   if (filteredCustomerKeys.size === 0) {
-    return { customers: [], availableYears };
+    return { customers: [], availableYears, today };
   }
+
+  const appConfig = (window.AppData && window.AppData.appConfig) || window.DEFAULT_APP_CONFIG || {};
+  const loyaltyCfg = appConfig.loyaltyIndex || { seedlingMaxDays: 45, regularMaxDays: 180, veteranMaxDays: 365 };
+  const priorityMatrix = appConfig.adminPriorityMatrix || {};
 
   const customers = Array.from(filteredCustomerKeys).map(custKey => {
     const historyRows = customerHistoryMap[custKey] || [];
@@ -453,9 +477,9 @@ function buildInsightCustomers(rawData) {
 
     const tenureDays = Math.max(0, (lastPurchaseDate - firstPurchaseDate) / (1000 * 60 * 60 * 24));
     let loyaltyTier = "🌱 Seedling";
-    if (tenureDays > 365) loyaltyTier = "🏅 Legendary (1Y+)";
-    else if (tenureDays > 180) loyaltyTier = "🥈 Veteran (6M+)";
-    else if (tenureDays > 45) loyaltyTier = "🥉 Regular";
+    if (tenureDays > loyaltyCfg.veteranMaxDays) loyaltyTier = "🏅 Legendary (1Y+)";
+    else if (tenureDays > loyaltyCfg.regularMaxDays) loyaltyTier = "🥈 Veteran (6M+)";
+    else if (tenureDays > loyaltyCfg.seedlingMaxDays) loyaltyTier = "🥉 Regular";
 
     const entryProduct = window.getRowValue(firstOrder.row, ['Product Set', 'ชื่อสินค้า', 'Product', 'รายการขาย']) || "-";
 
@@ -484,21 +508,11 @@ function buildInsightCustomers(rawData) {
     else if (daysSinceLast <= refillWindow + 3) segment2 = "REFILL";
     else if (daysSinceLast <= refillWindow + 59) segment2 = "RISK";
 
-    // Wording note: the Thai parenthetical here is what shows to admins as the
-    // "sales opportunity" framing — keep the English High/Medium/Low/Win-back
-    // keyword intact since getAdminPriClass() and the Excel export match on it.
-    let adminPriority = "4. 🔴 Win-back (โอกาสดึงลูกค้ากลับ)";
-    if (segment2 === "REFILL") {
-      adminPriority = "1. 🟢 High (โอกาสสร้างยอดขาย)";
-    } else if (segment1 === "NEW" || segment2 === "NEW" || (segment1 === "RISK" && segment2 === "RISK")) {
-      adminPriority = "2. 🟡 Medium (สร้างความสัมพันธ์)";
-    } else if (
-      (segment1 === "ACTIVE" && segment2 === "ACTIVE") ||
-      ((segment1 === "RISK" || segment1 === "CHURN") && segment2 === "ACTIVE") ||
-      (segment1 === "ACTIVE" && segment2 === "RISK")
-    ) {
-      adminPriority = "3. 🟠 Low (ดูแลสัมพันธ์)";
-    }
+    // Priority level per (segment1, segment2) comes from Config_App >
+    // adminPriorityMatrix (editable in Settings) — falls back to Win-back if
+    // the matrix is missing this combo (e.g. a sheet edited down to fewer rows).
+    const priorityLevel = priorityMatrix[segment1 + "|" + segment2] || "Win-back";
+    const adminPriority = ADMIN_PRIORITY_LABELS[priorityLevel] || ADMIN_PRIORITY_LABELS["Win-back"];
 
     let actionStrategy = "✅ Healthy Care: ดูแลตามปกติ";
     if (segment1 === "ACTIVE" && segment2 === "REFILL") actionStrategy = "🎯 Golden Period: ทักปิดยอดด่วน!";
@@ -594,7 +608,7 @@ function buildInsightCustomers(rawData) {
       totalOrdersStr: String(totalOrders),
       totalRevenueStr: "฿" + totalRevenue.toLocaleString(undefined, {maximumFractionDigits:0}),
       aovStr: "฿" + aov.toLocaleString(undefined, {maximumFractionDigits:0}),
-      daysSinceLastStr: daysSinceLast.toFixed(1)
+      daysSinceLastStr: String(Math.round(daysSinceLast))
     };
 
     // ตั้งค่าแสดงผลบนตารางหน้าหลักเป็น ยอดเงินบาท
@@ -611,6 +625,7 @@ function buildInsightCustomers(rawData) {
   hubCache.rawLen = rawData.length;
   hubCache.customers = customers;
   hubCache.years = availableYears;
+  hubCache.today = today;
   hubCache.uniq = {};
   console.info('[InsightHub] rows:', rawData.length,
     '| sale rows:', rawSaleOrders.length,
@@ -618,10 +633,12 @@ function buildInsightCustomers(rawData) {
     '| customers:', customers.length,
     '| total revenue:', customers.reduce((s, c) => s + c.totalRevenue, 0).toLocaleString());
 
-  return { customers, availableYears };
+  return { customers, availableYears, today };
 }
 window.buildInsightCustomers = buildInsightCustomers;
 window.getAnnualTier = getAnnualTier; // exposed for js/dashboard.js's Customer Tier Distribution donut
+window.getRowChannelStd = getRowChannelStd; // exposed for js/dashboard.js's SubChannel breakdown
+window.computeTrendVisual = computeTrendVisual; // exposed for js/dashboard.js's Trend Visual count cards
 
 function renderInsightHub(filteredData, rawData) {
   const container = document.getElementById('view-insighthub');
@@ -657,41 +674,45 @@ function renderInsightHub(filteredData, rawData) {
       .hub-summary-sections {
         display: grid;
         grid-template-columns: 1.5fr 1fr;
-        gap: 20px;
-        margin-bottom: 25px;
+        gap: 16px;
+        margin-bottom: 16px;
+      }
+      @media (max-width: 900px) {
+        .hub-summary-sections { grid-template-columns: 1fr; }
       }
       .summary-section-box {
         background: #fff;
         border-radius: 16px;
-        padding: 20px;
+        padding: 14px 16px;
         box-shadow: 0 4px 15px rgba(0,0,0,0.02);
         border: 1px solid #f0e6df;
       }
       .summary-section-box h3 {
-        font-size: 14px;
+        font-size: 13px;
         font-weight: 700;
         color: #7a665e;
-        margin-bottom: 15px;
+        margin-bottom: 10px;
         text-transform: uppercase;
         letter-spacing: 0.5px;
         border-bottom: 1px solid #eee;
-        padding-bottom: 8px;
+        padding-bottom: 6px;
       }
-      
+
       .kpi-cards-row {
         display: flex;
         flex-wrap: wrap;
-        gap: 12px;
+        gap: 10px;
       }
       .mini-kpi-card {
         flex: 1;
-        min-width: 110px;
+        min-width: 92px;
         background: #faf8f5;
         border: 1px solid #eee0d5;
         border-radius: 12px;
-        padding: 12px;
+        padding: 10px 8px;
         text-align: center;
         transition: transform 0.2s;
+        overflow-wrap: anywhere;
       }
       .mini-kpi-card:hover {
         transform: translateY(-2px);
@@ -701,16 +722,18 @@ function renderInsightHub(filteredData, rawData) {
         border-color: #f68843;
       }
       .kpi-card-val {
-        font-size: 20px;
+        font-size: 17px;
         font-weight: 700;
         color: #2d1e1a;
         margin-bottom: 2px;
+        line-height: 1.25;
       }
       .kpi-card-lbl {
-        font-size: 11px;
+        font-size: 10.5px;
         font-weight: 600;
         color: #7a665e;
         margin-bottom: 4px;
+        line-height: 1.3;
       }
       .kpi-card-pct {
         font-size: 10px;
@@ -730,7 +753,7 @@ function renderInsightHub(filteredData, rawData) {
       .table-wrapper {
         overflow-x: auto;
         overflow-y: auto;
-        max-height: 70vh;
+        max-height: 78vh;
         max-width: 100%;
         scrollbar-width: thin;
       }
@@ -760,6 +783,38 @@ function renderInsightHub(filteredData, rawData) {
         color: #333;
       }
       .customer-table tr:hover td {
+        background-color: #fafafa;
+      }
+
+      /* Freeze panes: header row (already sticky top above) + first two columns */
+      .customer-table th:nth-child(1),
+      .customer-table th:nth-child(2) {
+        z-index: 4;
+      }
+      .customer-table th:nth-child(1),
+      .customer-table td:nth-child(1) {
+        position: sticky;
+        left: 0;
+        width: 130px;
+        max-width: 130px;
+      }
+      .customer-table th:nth-child(2),
+      .customer-table td:nth-child(2) {
+        position: sticky;
+        left: 130px;
+        width: 170px;
+        max-width: 170px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        box-shadow: 2px 0 4px -2px rgba(0,0,0,0.15);
+      }
+      .customer-table td:nth-child(1),
+      .customer-table td:nth-child(2) {
+        z-index: 2;
+        background-color: #fff;
+      }
+      .customer-table tr:hover td:nth-child(1),
+      .customer-table tr:hover td:nth-child(2) {
         background-color: #fafafa;
       }
       .hub-status-select, .hub-note-input {
@@ -1045,13 +1100,25 @@ function renderInsightHub(filteredData, rawData) {
 
   const state = window.insightHubState;
 
-  const { customers, availableYears } = window.buildInsightCustomers(rawData);
+  const { customers, availableYears, today } = window.buildInsightCustomers(rawData);
   window.insightHubState.availableYears = availableYears;
 
   if (customers.length === 0) {
     container.innerHTML = '<div style="text-align:center; padding:50px; color:#999;">No customers found matching the filters.</div>';
     return;
   }
+
+  // "ปี" filter (with an "All" option) picking which year counts as "current"
+  // for the Tier ปีปัจจุบัน column and the amount/Tier toggle — a single
+  // dedicated selector instead of the per-column Excel filter on a tier-year
+  // column, which has one near-unique value per customer and is unwieldy to
+  // open/use for this purpose.
+  if (!state.selectedTierYear) state.selectedTierYear = 'all';
+  if (state.showTierInsteadOfAmount === undefined) state.showTierInsteadOfAmount = false;
+  const latestAvailableYear = availableYears.length ? availableYears[availableYears.length - 1] : today.getFullYear();
+  const currentYear = (state.selectedTierYear !== 'all' && availableYears.includes(Number(state.selectedTierYear)))
+    ? Number(state.selectedTierYear)
+    : latestAvailableYear;
 
   window.insightHubState.allCustomers = customers;
 
@@ -1063,6 +1130,11 @@ function renderInsightHub(filteredData, rawData) {
     const n = notesByKey[c.phone];
     c.latestNote = n && n.note ? n.note : "-";
     c.latestStatuses = n && n.statuses && n.statuses.length ? n.statuses.join(", ") : "-";
+
+    const currentYearAmount = (c.annualSpending && c.annualSpending[currentYear]) || 0;
+    c.currentYearAmount = currentYearAmount;
+    c.currentYearTier = getAnnualTier(currentYearAmount);
+    c.trendVisual = computeTrendVisual(c, availableYears, today);
   });
 
   if (state.selectedCustomerPhone) {
@@ -1197,11 +1269,23 @@ function renderInsightHub(filteredData, rawData) {
   }
 
   let html = `
-    <div class="hub-header" style="display: flex; align-items: center; justify-content: space-between;">
+    <div class="hub-header" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
       <h2>Customer Insight Hub</h2>
-      <button class="pag-btn" style="background: #15803d; color: white; border-color: #15803d; font-weight: 600;" onclick="exportInsightHubExcel()">
-        <i class="fas fa-file-excel"></i> Export Excel
-      </button>
+      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+        <label style="font-size:12.5px; color:rgba(255,255,255,0.8); font-weight:600; display:flex; align-items:center; gap:6px;">
+          ปี:
+          <select id="hub-year-filter" onchange="setHubTierYear(this.value)" style="padding:6px 10px; border-radius:6px; border:1px solid rgba(255,255,255,0.3); background:#fff; font-size:12.5px; color:#333;">
+            <option value="all" ${state.selectedTierYear === 'all' ? 'selected' : ''}>All</option>
+            ${availableYears.map(y => `<option value="${y}" ${String(y) === String(state.selectedTierYear) ? 'selected' : ''}>${y}</option>`).join('')}
+          </select>
+        </label>
+        <button class="pag-btn" onclick="toggleTierAmountView()" title="สลับมุมมองคอลัมน์ยอดซื้อรายปี: ตัวเลข / Tier">
+          <i class="fas fa-repeat"></i> ${state.showTierInsteadOfAmount ? 'แสดงเป็นตัวเลข' : 'แสดงเป็น Tier'}
+        </button>
+        <button class="pag-btn" style="background: #15803d; color: white; border-color: #15803d; font-weight: 600;" onclick="exportInsightHubExcel()">
+          <i class="fas fa-file-excel"></i> Export Excel
+        </button>
+      </div>
     </div>
 
     <div class="hub-summary-sections">
@@ -1274,7 +1358,11 @@ function renderInsightHub(filteredData, rawData) {
               ${makeExcelHeaderTh('lastProductStr', 'Last Product')}
               ${makeExcelHeaderTh('nextPurchaseDateObj', 'Next Purchase Date')}
               
-              ${makeExcelHeaderTh('ltvTier', 'Life time value', 'th-insight')}
+              <th class="th-insight">
+                <div class="th-container">
+                  <span class="th-label" onclick="setHubSort('currentYearTier')">Tier ปีปัจจุบัน (${currentYear}) ${getSortIcon('currentYearTier')}</span>
+                </div>
+              </th>
               ${makeExcelHeaderTh('loyaltyTier', 'Loyalty Index', 'th-insight')}
               ${makeExcelHeaderTh('entryProduct', 'Entry Product (สินค้าเปิดใจ)', 'th-insight')}
               ${makeExcelHeaderTh('currentFavorite', 'Current Favorite (สินค้าตัวโปรด)', 'th-insight')}
@@ -1287,7 +1375,12 @@ function renderInsightHub(filteredData, rawData) {
               ${makeExcelHeaderTh('lastChannel', 'LastChannel (Main)', 'th-action')}
               ${makeExcelHeaderTh('lastAdmin', 'Last Admin', 'th-action')}
               
-              ${state.availableYears.map(y => makeExcelHeaderTh('tier' + y, `ยอดซื้อปี ${y}`, 'th-tiers')).join('')}
+              ${state.availableYears.map(y => makeExcelHeaderTh('tier' + y, (state.showTierInsteadOfAmount ? `Tier ปี ${y}` : `ยอดซื้อปี ${y}`), 'th-tiers')).join('')}
+              <th class="th-tiers">
+                <div class="th-container">
+                  <span class="th-label">Trend Visual</span>
+                </div>
+              </th>
               ${makeExcelHeaderTh('latestStatuses', 'สถานะล่าสุด (Contact)', 'th-action')}
               <th class="th-action">
                 <div class="th-container">
@@ -1308,7 +1401,7 @@ function renderInsightHub(filteredData, rawData) {
                 return `
               <tr>
                 <td style="font-weight: 600; cursor: pointer; color: #d95f1d; text-decoration: underline;" onclick="openCustomerProfile('${c.phone}')">${c.displayPhone}</td>
-                <td style="font-weight: 600; cursor: pointer; color: #d95f1d; text-decoration: underline;" onclick="openCustomerProfile('${c.phone}')">${c.name}</td>
+                <td style="font-weight: 600; cursor: pointer; color: #d95f1d; text-decoration: underline;" onclick="openCustomerProfile('${c.phone}')" title="${escapeHtml(c.name)}">${c.name}</td>
                 <td>${c.firstPurchaseStr}</td>
                 <td>${c.lastPurchaseStr}</td>
                 <td style="text-align: center;">${c.totalOrders}</td>
@@ -1318,7 +1411,7 @@ function renderInsightHub(filteredData, rawData) {
                 <td style="max-width: 250px; overflow: hidden; text-overflow: ellipsis;" title="${c.lastProductStr}">${c.lastProductStr || "-"}</td>
                 <td style="font-weight: 600; color: #0269a1;">${c.nextPurchaseStr}</td>
                 
-                <td><span class="badge-span ${getLtvClass(c.ltvTier)}">${c.ltvTier}</span></td>
+                <td>${c.currentYearTier ? `<span class="badge-span ${getCustomerTierClass(c.currentYearTier)}">${c.currentYearTier}</span>` : '-'}</td>
                 <td><span class="badge-span ${getLoyaltyClass(c.loyaltyTier)}">${c.loyaltyTier}</span></td>
                 <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;" title="${c.entryProduct}">${c.entryProduct || "-"}</td>
                 <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;" title="${c.currentFavorite}">${c.currentFavorite || "-"}</td>
@@ -1331,7 +1424,16 @@ function renderInsightHub(filteredData, rawData) {
                 <td>${c.lastChannel}</td>
                 <td>${c.lastAdmin}</td>
                 
-                ${state.availableYears.map(y => '<td style="text-align: right; font-weight: 500;">' + c['tier' + y] + '</td>').join('')}
+                ${state.availableYears.map(y => {
+                  if (!state.showTierInsteadOfAmount) {
+                    return '<td style="text-align: right; font-weight: 500;">' + c['tier' + y] + '</td>';
+                  }
+                  const yearTier = getAnnualTier((c.annualSpending && c.annualSpending[y]) || 0);
+                  return '<td style="text-align: center;">' + (yearTier ? `<span class="badge-span ${getCustomerTierClass(yearTier)}">${yearTier}</span>` : '-') + '</td>';
+                }).join('')}
+                <td style="text-align: center;" title="${c.trendVisual ? c.trendVisual.label : 'ไม่มีข้อมูลปีก่อนหน้าให้เทียบ'}">
+                  ${c.trendVisual ? `<span style="display:inline-block; width:14px; height:14px; border-radius:50%; background:${c.trendVisual.color};"></span>` : '<span style="color:#ccc;">-</span>'}
+                </td>
                 <td>
                   <select class="hub-status-select" onchange="window.updateInlineStatus('${c.phone}', this.value)">
                     <option value="" ${currentStatus === "" ? 'selected' : ''}>— เลือกสถานะ —</option>
@@ -1499,7 +1601,7 @@ window.exportInsightHubExcel = function() {
       'DaysSinceLast': Number(c.daysSinceLastStr),
       'Last Product': c.lastProductStr || '-',
       'Next Purchase Date': c.nextPurchaseStr,
-      'Life time value': c.ltvTier,
+      'Tier ปีปัจจุบัน': c.currentYearTier || '-',
       'Loyalty Index': c.loyaltyTier,
       'Entry Product (สินค้าเปิดใจ)': c.entryProduct || '-',
       'Current Favorite (สินค้าตัวโปรด)': c.currentFavorite || '-',
@@ -1512,6 +1614,7 @@ window.exportInsightHubExcel = function() {
       'Last Admin': c.lastAdmin
     };
     years.forEach(y => { row[`ยอดซื้อปี ${y}`] = c['tier' + y]; });
+    row['Trend Visual'] = c.trendVisual ? c.trendVisual.label : '-';
     row['สถานะล่าสุด (Contact)'] = c.latestStatuses;
     row['Sales Note ล่าสุด'] = c.latestNote;
     return row;
@@ -1540,6 +1643,16 @@ window.setHubPage = function(pageNumber) {
   if (window.applyFilters) window.applyFilters();
 };
 
+window.setHubTierYear = function(value) {
+  window.insightHubState.selectedTierYear = value;
+  if (window.applyFilters) window.applyFilters();
+};
+
+window.toggleTierAmountView = function() {
+  window.insightHubState.showTierInsteadOfAmount = !window.insightHubState.showTierInsteadOfAmount;
+  if (window.applyFilters) window.applyFilters();
+};
+
 // Customer Tier รายปีในโปรไฟล์ลูกค้า: คำนวณจากยอดซื้อสะสมของปีนั้นๆ เท่านั้น
 // Junior < 5,900 | Silver 5,900-<25,000 | Gold 25,000-<35,000 | Platinum 35,000-<45,000 | Diamond >= 45,000
 // คืนค่า null ถ้ายอดปีนั้น = 0 (กรณีนี้ไม่ต้องแสดง Tier)
@@ -1558,6 +1671,51 @@ function getCustomerTierClass(tier) {
   if (tier === "Gold") return "ctier-gold";
   if (tier === "Silver") return "ctier-silver";
   return "ctier-junior";
+}
+
+const TIER_RANK = { Junior: 1, Silver: 2, Gold: 3, Platinum: 4, Diamond: 5 };
+
+// Year-over-year trend indicator comparing the two most recent years a
+// customer has spending in. If the most recent year is the real current
+// calendar year and isn't over yet, its amount is interpolated to a
+// full-year-equivalent (amountSoFar / (dayOfYear / 365)) before comparing —
+// otherwise a partial year always reads as "down" against a full prior year.
+// Combos not in the 5-color spec (e.g. tier up + amount down, or no prior
+// year to compare against) return null — rendered as a neutral dash.
+function computeTrendVisual(c, availableYears, todayRef) {
+  if (!availableYears || availableYears.length < 2) return null;
+  const cfg = (window.AppData && window.AppData.appConfig && window.AppData.appConfig.trendVisual) || { neutralBandPercent: 0, interpolateCurrentYear: true };
+  const lastYear = availableYears[availableYears.length - 1];
+  const prevYear = availableYears[availableYears.length - 2];
+  const prevAmt = (c.annualSpending && c.annualSpending[prevYear]) || 0;
+  let lastAmt = (c.annualSpending && c.annualSpending[lastYear]) || 0;
+  if (prevAmt <= 0) return null;
+
+  if (cfg.interpolateCurrentYear && todayRef && lastYear === todayRef.getFullYear()) {
+    const startOfYear = new Date(todayRef.getFullYear(), 0, 1);
+    const dayOfYear = Math.ceil((todayRef - startOfYear) / (1000 * 60 * 60 * 24)) + 1;
+    if (dayOfYear > 0 && dayOfYear < 365) {
+      lastAmt = lastAmt / (dayOfYear / 365);
+    }
+  }
+
+  const prevTier = getAnnualTier(prevAmt);
+  const lastTier = getAnnualTier(lastAmt);
+  const prevRank = prevTier ? TIER_RANK[prevTier] : 0;
+  const lastRank = lastTier ? TIER_RANK[lastTier] : 0;
+
+  // Within the neutral band (± %), an amount change counts as "same" rather
+  // than up/down — keeps small noise from flipping the trend color.
+  const band = (Math.max(0, cfg.neutralBandPercent || 0) / 100) * prevAmt;
+  const amountDir = lastAmt > prevAmt + band ? "up" : (lastAmt < prevAmt - band ? "down" : "same");
+  const tierDir = lastRank > prevRank ? "up" : (lastRank < prevRank ? "down" : "same");
+
+  if (amountDir === "down" && tierDir === "down") return { color: "#dc2626", label: "ยอดซื้อและ Tier ลดลง" };
+  if (amountDir === "up" && tierDir === "down") return { color: "#f97316", label: "ยอดซื้อเพิ่มขึ้น แต่ Tier ลดลง" };
+  if (amountDir === "down" && tierDir === "same") return { color: "#eab308", label: "ยอดซื้อลดลง Tier เท่าเดิม" };
+  if (amountDir === "up" && tierDir === "same") return { color: "#0ea5e9", label: "ยอดซื้อเพิ่มขึ้น Tier เท่าเดิม" };
+  if (amountDir === "up" && tierDir === "up") return { color: "#16a34a", label: "ยอดซื้อและ Tier เพิ่มขึ้น" };
+  return null;
 }
 
 function getLtvClass(tier) {
