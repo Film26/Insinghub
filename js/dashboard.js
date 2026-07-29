@@ -265,6 +265,241 @@ function buildAdminStats(rows) {
     .sort((a, b) => b.revenue - a.revenue);
 }
 
+// ---------------------------------------------------------------------------
+// Customer Tier / Segment aggregates for the Dashboard's Team Report + Admin
+// Priority section. Built on window.buildInsightCustomers (js/insighthub.js)
+// so counts always match the Customer InsightHub page — one computation, two
+// pages reading it.
+// ---------------------------------------------------------------------------
+
+const TIER_ORDER = ["Diamond", "Platinum", "Gold", "Silver", "Junior"];
+const TIER_COLORS = {
+  Diamond: "#2a78d6",
+  Platinum: "#4a3aa7",
+  Gold: "#eda100",
+  Silver: "#1baf7a",
+  Junior: "#008300",
+};
+const SEGMENT1_ORDER = ["NEW", "ACTIVE", "RISK", "CHURN"];
+const SEGMENT1_ICON = { NEW: "fa-star", ACTIVE: "fa-bolt", RISK: "fa-triangle-exclamation", CHURN: "fa-user-slash" };
+const SEGMENT2_ORDER = ["NEW", "ACTIVE", "REFILL", "RISK", "CHURN"];
+const ADMIN_PRIORITY_ORDER = ["High", "Medium", "Low", "Win-back"];
+const ADMIN_PRIORITY_META = {
+  High: { icon: "fa-fire", label: "โอกาสสร้างยอดขายสูง" },
+  Medium: { icon: "fa-handshake", label: "โอกาสสร้างยอดขายปานกลาง" },
+  Low: { icon: "fa-heart", label: "ดูแลความสัมพันธ์" },
+  "Win-back": { icon: "fa-rotate-left", label: "โอกาสดึงลูกค้ากลับ" },
+};
+
+function pctStr(n, total) {
+  return total > 0 ? ((n / total) * 100).toFixed(1) : "0.0";
+}
+
+function buildDashboardAggregates(rawData) {
+  const { customers } = window.buildInsightCustomers(rawData);
+  const tierCounts = { Diamond: 0, Platinum: 0, Gold: 0, Silver: 0, Junior: 0 };
+  const segment1Counts = { NEW: 0, ACTIVE: 0, RISK: 0, CHURN: 0 };
+  const segment2Counts = { NEW: 0, ACTIVE: 0, REFILL: 0, RISK: 0, CHURN: 0 };
+
+  customers.forEach((c) => {
+    const tier = window.getAnnualTier(c.totalRevenue);
+    if (tier && tierCounts[tier] !== undefined) tierCounts[tier]++;
+    if (segment1Counts[c.segment1] !== undefined) segment1Counts[c.segment1]++;
+    if (segment2Counts[c.segment2] !== undefined) segment2Counts[c.segment2]++;
+  });
+
+  return { customers, tierCounts, segment1Counts, segment2Counts, total: customers.length };
+}
+
+// adminPriority values are e.g. "1. 🟢 High (โอกาสสร้างยอดขาย)" — group by the
+// English keyword, same convention getAdminPriClass() uses in js/insighthub.js.
+function countAdminPriorities(customers) {
+  const counts = { High: 0, Medium: 0, Low: 0, "Win-back": 0 };
+  customers.forEach((c) => {
+    const key = ADMIN_PRIORITY_ORDER.find((k) => c.adminPriority.includes(k));
+    if (key) counts[key]++;
+  });
+  return counts;
+}
+
+const TREND_MONTH_LABELS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+
+function getAdminYearRange(rawData) {
+  const years = new Set();
+  rawData.forEach((r) => {
+    if (!window.isSaleOrder(r)) return;
+    const d = window.parseDate(window.getRowValue(r, DATE_KEYS));
+    if (d) years.add(d.y);
+  });
+  return Array.from(years).sort((a, b) => a - b);
+}
+
+// yearFilter: a specific year (number/string), or "all" for one point per year.
+function buildAdminTrendSeries(rawData, adminName, yearFilter) {
+  const rows = rawData.filter((r) => window.isSaleOrder(r) && window.getNormalizedAdmin(r) === adminName);
+
+  if (yearFilter === "all") {
+    const years = getAdminYearRange(rawData);
+    const totals = years.map((y) =>
+      rows.reduce((sum, r) => {
+        const d = window.parseDate(window.getRowValue(r, DATE_KEYS));
+        return d && d.y === y ? sum + getRowRevenue(r) : sum;
+      }, 0)
+    );
+    return { labels: years.map(String), data: totals };
+  }
+
+  const monthTotals = new Array(12).fill(0);
+  rows.forEach((r) => {
+    const d = window.parseDate(window.getRowValue(r, DATE_KEYS));
+    if (d && d.y === Number(yearFilter)) monthTotals[d.m - 1] += getRowRevenue(r);
+  });
+  return { labels: TREND_MONTH_LABELS, data: monthTotals };
+}
+
+// ---------------------------------------------------------------------------
+// Chart.js wiring — every chart canvas is re-created on each re-render (the
+// container's innerHTML is replaced wholesale each time), so instances are
+// tracked by canvas id and destroyed before a new one is built; Chart.js
+// throws/leaks if a canvas that already has a live chart gets reused.
+// ---------------------------------------------------------------------------
+
+window.__dashboardCharts = window.__dashboardCharts || {};
+
+function renderChartInto(canvasId, config) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas || typeof Chart === "undefined") return null;
+  if (window.__dashboardCharts[canvasId]) {
+    window.__dashboardCharts[canvasId].destroy();
+  }
+  const chart = new Chart(canvas.getContext("2d"), config);
+  window.__dashboardCharts[canvasId] = chart;
+  return chart;
+}
+
+// Draws a leader line + label outside the donut for slices under `threshold`
+// share of the total — Chart.js has no built-in outside-label support, so
+// this small plugin does it directly on the canvas after Chart.js draws.
+const tierOutlabelsPlugin = {
+  id: "tierOutlabels",
+  afterDraw(chart, args, opts) {
+    if (!opts || !opts.enabled) return;
+    const meta = chart.getDatasetMeta(0);
+    const dataset = chart.data.datasets[0];
+    const total = dataset.data.reduce((a, b) => a + b, 0);
+    if (!total) return;
+    const { ctx } = chart;
+
+    meta.data.forEach((arc, i) => {
+      const value = dataset.data[i];
+      if (!value) return;
+      const share = value / total;
+      if (share >= opts.threshold) return; // big slices already read fine in the legend
+
+      const angle = (arc.startAngle + arc.endAngle) / 2;
+      const cx = arc.x, cy = arc.y;
+      const outerR = arc.outerRadius;
+      const startX = cx + Math.cos(angle) * outerR;
+      const startY = cy + Math.sin(angle) * outerR;
+      const bendR = outerR + 14;
+      const bendX = cx + Math.cos(angle) * bendR;
+      const bendY = cy + Math.sin(angle) * bendR;
+      const isRight = Math.cos(angle) >= 0;
+      const labelX = bendX + (isRight ? 16 : -16);
+
+      ctx.save();
+      ctx.strokeStyle = "#c3c2b7";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(startX, startY);
+      ctx.lineTo(bendX, bendY);
+      ctx.lineTo(labelX, bendY);
+      ctx.stroke();
+
+      ctx.fillStyle = "#334155";
+      ctx.font = "600 11px Inter, sans-serif";
+      ctx.textBaseline = "middle";
+      ctx.textAlign = isRight ? "left" : "right";
+      ctx.fillText(
+        `${chart.data.labels[i]}: ${value} (${(share * 100).toFixed(1)}%)`,
+        labelX + (isRight ? 4 : -4),
+        bendY
+      );
+      ctx.restore();
+    });
+  },
+};
+if (typeof Chart !== "undefined") Chart.register(tierOutlabelsPlugin);
+
+function buildTierDonutConfig(tierCounts, total) {
+  return {
+    type: "doughnut",
+    data: {
+      labels: TIER_ORDER,
+      datasets: [{
+        data: TIER_ORDER.map((t) => tierCounts[t]),
+        backgroundColor: TIER_ORDER.map((t) => TIER_COLORS[t]),
+        borderColor: "#fff",
+        borderWidth: 2,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: "62%",
+      layout: { padding: 44 }, // room for outside callout labels
+      plugins: {
+        legend: { display: false }, // custom legend below shows count + %
+        tooltip: {
+          callbacks: {
+            label: (ctx) => `${ctx.label}: ${ctx.parsed.toLocaleString()} (${pctStr(ctx.parsed, total)}%)`,
+          },
+        },
+        tierOutlabels: { enabled: true, threshold: 0.05 },
+      },
+    },
+  };
+}
+
+function buildTrendLineConfig(series, yearFilter) {
+  return {
+    type: "line",
+    data: {
+      labels: series.labels,
+      datasets: [{
+        label: yearFilter === "all" ? "ยอดขายรายปี" : "ยอดขายรายเดือน",
+        data: series.data,
+        borderColor: "#d95f1d",
+        backgroundColor: "rgba(217, 95, 29, 0.12)",
+        pointBackgroundColor: "#d95f1d",
+        pointRadius: 4,
+        pointHoverRadius: 6,
+        borderWidth: 2,
+        tension: 0.3,
+        fill: true,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: { label: (ctx) => fmtMoney(ctx.parsed.y) },
+        },
+      },
+      scales: {
+        y: {
+          beginAtZero: true,
+          ticks: { callback: (v) => fmtMoney(v) },
+          grid: { color: "#f1f5f9" },
+        },
+        x: { grid: { display: false } },
+      },
+    },
+  };
+}
+
 function emptyStateHtml(message) {
   return `
     <div class="empty-state">
@@ -344,6 +579,7 @@ function renderTeamReport(container, rawData, session) {
   const maxChannelRevenue = Math.max(1, ...Object.values(channelTotals));
 
   const adminStats = buildAdminStats(rawData);
+  const dashAgg = buildDashboardAggregates(rawData);
 
   const confidentialHtml =
     session.role === window.CrmRoles.ROLES.SUPER_ADMIN
@@ -365,6 +601,61 @@ function renderTeamReport(container, rawData, session) {
       <div class="overview-kpi-card"><div class="icon"><i class="fas fa-receipt"></i></div><div class="lbl">Total Orders</div><div class="val">${totalOrders.toLocaleString()}</div></div>
       <div class="overview-kpi-card"><div class="icon"><i class="fas fa-sack-dollar"></i></div><div class="lbl">Total Revenue</div><div class="val">${fmtMoney(totalRevenue)}</div></div>
       <div class="overview-kpi-card"><div class="icon"><i class="fas fa-scale-balanced"></i></div><div class="lbl">Avg. Order Value</div><div class="val">${fmtMoney(aov)}</div></div>
+    </div>
+
+    <div class="overview-section">
+      <h3>สัดส่วน Tier ลูกค้า (Customer Tier Distribution)</h3>
+      <div class="tier-donut-row">
+        <div class="tier-donut-canvas-wrap"><canvas id="team-tier-donut"></canvas></div>
+        <div class="tier-legend">
+          ${TIER_ORDER.map(
+            (t) => `
+            <div class="tier-legend-row">
+              <span class="tier-legend-dot" style="background:${TIER_COLORS[t]}"></span>
+              <span class="tier-legend-name">${t}</span>
+              <span class="tier-legend-count">${dashAgg.tierCounts[t].toLocaleString()}</span>
+              <span class="tier-legend-pct">${pctStr(dashAgg.tierCounts[t], dashAgg.total)}%</span>
+            </div>
+          `
+          ).join("")}
+        </div>
+      </div>
+    </div>
+
+    <div class="overview-section">
+      <h3>Segment ลูกค้า (Customer Segments)</h3>
+      <div class="overview-kpi-grid">
+        ${SEGMENT1_ORDER.map(
+          (seg) => `
+          <div class="overview-kpi-card">
+            <div class="icon"><i class="fas ${SEGMENT1_ICON[seg]}"></i></div>
+            <div class="lbl">${seg}</div>
+            <div class="val">${dashAgg.segment1Counts[seg].toLocaleString()}</div>
+            <div class="pct">${pctStr(dashAgg.segment1Counts[seg], dashAgg.total)}%</div>
+          </div>
+        `
+        ).join("")}
+      </div>
+    </div>
+
+    <div class="overview-section">
+      <h3>RFM Segment (รอบเติมสินค้ารายบุคคล)</h3>
+      <table class="overview-table">
+        <thead>
+          <tr><th>Segment</th><th style="text-align:right;">จำนวนคน</th><th style="text-align:right;">สัดส่วน %</th></tr>
+        </thead>
+        <tbody>
+          ${SEGMENT2_ORDER.map(
+            (seg) => `
+            <tr>
+              <td style="font-weight:600;">${seg}</td>
+              <td style="text-align:right;">${dashAgg.segment2Counts[seg].toLocaleString()}</td>
+              <td style="text-align:right;">${pctStr(dashAgg.segment2Counts[seg], dashAgg.total)}%</td>
+            </tr>
+          `
+          ).join("")}
+        </tbody>
+      </table>
     </div>
 
     <div class="overview-section">
@@ -413,6 +704,8 @@ function renderTeamReport(container, rawData, session) {
       ${buildRecentOrdersTable(saleRows, 10)}
     </div>
   `;
+
+  renderChartInto("team-tier-donut", buildTierDonutConfig(dashAgg.tierCounts, dashAgg.total));
 }
 
 function renderIndividualAdminReport(container, rawData, session) {
@@ -444,6 +737,16 @@ function renderIndividualAdminReport(container, rawData, session) {
   const stat = adminStats.find((a) => a.admin === selected) || { orders: 0, revenue: 0, aov: 0, customers: 0 };
   const adminRows = rawData.filter((r) => window.isSaleOrder(r) && window.getNormalizedAdmin(r) === selected);
 
+  const { customers: allCustomers } = window.buildInsightCustomers(rawData);
+  const adminCustomers = allCustomers.filter((c) => c.lastAdmin === selected);
+  const priorityCounts = countAdminPriorities(adminCustomers);
+
+  const trendYears = getAdminYearRange(rawData);
+  let selectedYear = window.AppData.selectedTrendYear || "all";
+  if (selectedYear !== "all" && !trendYears.map(String).includes(String(selectedYear))) selectedYear = "all";
+  window.AppData.selectedTrendYear = selectedYear;
+  const trendSeries = buildAdminTrendSeries(rawData, selected, selectedYear);
+
   container.innerHTML = `
     <div class="admin-picker-row">
       <label for="admin-report-picker">เลือกแอดมิน:</label>
@@ -461,6 +764,34 @@ function renderIndividualAdminReport(container, rawData, session) {
     </div>
 
     <div class="overview-section">
+      <h3>โอกาสสร้างยอดขาย (Admin Priority)</h3>
+      <div class="overview-kpi-grid">
+        ${ADMIN_PRIORITY_ORDER.map((key) => {
+          const meta = ADMIN_PRIORITY_META[key];
+          return `
+          <div class="overview-kpi-card">
+            <div class="icon"><i class="fas ${meta.icon}"></i></div>
+            <div class="lbl">${meta.label}</div>
+            <div class="val">${priorityCounts[key].toLocaleString()}</div>
+            <div class="pct">${pctStr(priorityCounts[key], adminCustomers.length)}%</div>
+          </div>
+        `;
+        }).join("")}
+      </div>
+    </div>
+
+    <div class="overview-section">
+      <div class="overview-section-header">
+        <h3>แนวโน้มยอดขาย (Sales Trend)</h3>
+        <select id="trend-year-picker" class="trend-year-select">
+          <option value="all" ${selectedYear === "all" ? "selected" : ""}>รวมทุกปี</option>
+          ${trendYears.map((y) => `<option value="${y}" ${String(y) === String(selectedYear) ? "selected" : ""}>${y}</option>`).join("")}
+        </select>
+      </div>
+      <div class="trend-chart-wrap"><canvas id="admin-trend-chart"></canvas></div>
+    </div>
+
+    <div class="overview-section">
       <h3>ออเดอร์ล่าสุดของ ${selected === "Unknown" ? "(ไม่ระบุ)" : selected}${window.AppData.overviewSearchTerm ? ` (ค้นหา: "${window.AppData.overviewSearchTerm}")` : ""}</h3>
       ${buildRecentOrdersTable(adminRows, 15)}
     </div>
@@ -472,6 +803,13 @@ function renderIndividualAdminReport(container, rawData, session) {
       window.applyFilters();
     });
   }
+
+  document.getElementById("trend-year-picker").addEventListener("change", (e) => {
+    window.AppData.selectedTrendYear = e.target.value;
+    window.applyFilters();
+  });
+
+  renderChartInto("admin-trend-chart", buildTrendLineConfig(trendSeries, selectedYear));
 }
 
 function renderDashboardOverview(filteredData, rawData) {
