@@ -792,15 +792,13 @@ function renderInsightHub(filteredData, rawData) {
       }
       .customer-table th:nth-child(1),
       .customer-table td:nth-child(1) {
-        position: sticky;
-        left: 0;
+        /* [ปิดชั่วคราว] position: sticky; left: 0; ทำให้คอลัมน์ CustomerKey (Phone) เลื่อนตามตอนสกอลล์แนวนอน แต่ยังมีบัคอยู่ */
         width: 130px;
         max-width: 130px;
       }
       .customer-table th:nth-child(2),
       .customer-table td:nth-child(2) {
-        position: sticky;
-        left: 130px;
+        /* [ปิดชั่วคราว] position: sticky; left: 130px; (freeze คู่กับคอลัมน์ที่ 1 ด้านบน — ปิดพร้อมกันกันภาพซ้อนเพี้ยน) */
         width: 170px;
         max-width: 170px;
         overflow: hidden;
@@ -865,9 +863,9 @@ function renderInsightHub(filteredData, rawData) {
       }
       
       .excel-dropdown-menu {
-        position: absolute;
-        top: 100%;
-        right: 0;
+        /* position: fixed (ตั้งค่า top/left จริงด้วย JS ใน positionExcelDropdown) กันไม่ให้
+           .table-wrapper ที่มี overflow:auto ตัดขอบ dropdown จนโผล่ไม่ครบ/หายไปเวลาเลื่อนตาราง */
+        position: fixed;
         background: white;
         border: 1px solid #ccc;
         box-shadow: 0 4px 15px rgba(0,0,0,0.15);
@@ -1095,6 +1093,19 @@ function renderInsightHub(filteredData, rawData) {
       }
       if (changed && window.applyFilters) window.applyFilters();
     });
+
+    // dropdown ใช้ position:fixed ผูกพิกัดหน้าจอไว้ตอนเปิด -> ถ้าเลื่อน .table-wrapper (แนวนอน/แนวตั้ง)
+    // หรือ resize หน้าต่างระหว่างเปิดอยู่ ต้องคำนวณตำแหน่งใหม่ให้ตามปุ่มทัน ไม่งั้นจะหลุดตำแหน่ง
+    document.addEventListener('scroll', function(e) {
+      if (window.insightHubState.activeDropdown && e.target && e.target.classList && e.target.classList.contains('table-wrapper')) {
+        if (window.positionExcelDropdown) window.positionExcelDropdown(window.insightHubState.activeDropdown);
+      }
+    }, true);
+    window.addEventListener('resize', function() {
+      if (window.insightHubState.activeDropdown && window.positionExcelDropdown) {
+        window.positionExcelDropdown(window.insightHubState.activeDropdown);
+      }
+    });
   }
 
   const state = window.insightHubState;
@@ -1230,11 +1241,11 @@ function renderInsightHub(filteredData, rawData) {
       <th class="${extraClass}" style="position: relative;">
         <div class="th-container">
           <span class="th-label" onclick="setHubSort('${columnId}')">${displayTitle} ${getSortIcon(columnId)}</span>
-          <button class="excel-filter-btn ${hasActiveFilter ? 'active-filter' : ''}" onclick="event.stopPropagation(); toggleExcelDropdown('${columnId}')">
+          <button id="excel-btn-${columnId}" class="excel-filter-btn ${hasActiveFilter ? 'active-filter' : ''}" onclick="event.stopPropagation(); toggleExcelDropdown('${columnId}')">
             <i class="fas fa-filter"></i>
           </button>
-          
-          <div class="excel-dropdown-menu ${isOpen ? 'show' : ''}" onclick="event.stopPropagation();" style="width: 260px; position: absolute; background:#fff; border:1px solid #ccc; padding:10px; border-radius:8px; box-shadow:0 4px 15px rgba(0,0,0,0.15); z-index:9999;">
+
+          <div id="excel-dropdown-${columnId}" class="excel-dropdown-menu ${isOpen ? 'show' : ''}" onclick="event.stopPropagation();" style="width: 260px; position: fixed; background:#fff; border:1px solid #ccc; padding:10px; border-radius:8px; box-shadow:0 4px 15px rgba(0,0,0,0.15); z-index:9999;">
             <div style="font-size: 11px; margin-bottom: 8px; font-weight: normal; text-align: left;">
               <a href="javascript:void(0);" style="color: #2563eb; font-weight: bold; text-decoration: none;" onclick="excelSelectAllRows('${columnId}')">เลือกทั้งหมด</a>
               <span style="color: #ccc;"> | </span>
@@ -1357,11 +1368,7 @@ function renderInsightHub(filteredData, rawData) {
               ${makeExcelHeaderTh('lastProductStr', 'Last Product')}
               ${makeExcelHeaderTh('nextPurchaseDateObj', 'Next Purchase Date')}
               
-              <th class="th-insight">
-                <div class="th-container">
-                  <span class="th-label" onclick="setHubSort('currentYearTier')">Tier ปีปัจจุบัน (${currentYear}) ${getSortIcon('currentYearTier')}</span>
-                </div>
-              </th>
+              ${makeExcelHeaderTh('currentYearTier', `Tier ปีปัจจุบัน (${currentYear})`, 'th-insight')}
               ${makeExcelHeaderTh('loyaltyTier', 'Loyalty Index', 'th-insight')}
               ${makeExcelHeaderTh('entryProduct', 'Entry Product (สินค้าเปิดใจ)', 'th-insight')}
               ${makeExcelHeaderTh('currentFavorite', 'Current Favorite (สินค้าตัวโปรด)', 'th-insight')}
@@ -1478,6 +1485,9 @@ function renderInsightHub(filteredData, rawData) {
       __newTableWrapper.scrollTop = __savedTableScrollTop;
       __newTableWrapper.scrollLeft = __oldTableScrollLeft;
     }
+    if (window.insightHubState.activeDropdown && window.positionExcelDropdown) {
+      window.positionExcelDropdown(window.insightHubState.activeDropdown);
+    }
   }
 }
 
@@ -1488,6 +1498,33 @@ window.toggleExcelDropdown = function(colId) {
     window.insightHubState.activeDropdown = colId;
   }
   if (window.applyFilters) window.applyFilters();
+};
+
+// [FIX] dropdown ตัวกรองเดิมใช้ position:absolute ผูกกับ th ที่อยู่ใน .table-wrapper
+// (overflow:auto ทั้งแนวตั้ง/แนวนอน) ทำให้ dropdown ถูกตัดขอบจนโผล่ไม่ครบ/หายไปเวลาคอลัมน์
+// อยู่ใกล้ขอบตาราง -> ย้ายไป position:fixed แล้วคำนวณตำแหน่งจริงเป็นพิกัดหน้าจอ พร้อม
+// เบียดตำแหน่งให้อยู่ในขอบจอเสมอ (ไม่ทะลุขวา/ล่าง) เรียกซ้ำได้ตอน scroll/resize เพื่อตามปุ่มให้ทัน
+window.positionExcelDropdown = function(colId) {
+  if (!colId) return;
+  const btn = document.getElementById('excel-btn-' + colId);
+  const menu = document.getElementById('excel-dropdown-' + colId);
+  if (!btn || !menu) return;
+
+  const margin = 8;
+  const btnRect = btn.getBoundingClientRect();
+  const menuWidth = menu.offsetWidth || 260;
+  const menuHeight = menu.offsetHeight || 300;
+
+  let left = btnRect.right - menuWidth;
+  left = Math.max(margin, Math.min(left, window.innerWidth - menuWidth - margin));
+
+  let top = btnRect.bottom + 4;
+  if (top + menuHeight > window.innerHeight - margin) {
+    top = Math.max(margin, btnRect.top - menuHeight - 4);
+  }
+
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
 };
 
 window.handleDropdownSearch = function(colId, value) {
