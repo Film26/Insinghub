@@ -29,10 +29,13 @@
     Object.keys(params || {}).forEach((key) => {
       url.searchParams.set(key, params[key]);
     });
+    // กัน browser cache ตอบ response เก่าซ้ำ (URL เดิมทุก field เหมือนเดิมทุกครั้งที่เรียก
+    // เพราะเป็น GET ล้วน — ถ้าไม่กันไว้ กด Refresh แล้วอาจได้ข้อมูลเก่าที่ไม่ตรงกับชีตปัจจุบัน)
+    url.searchParams.set("_ts", Date.now().toString());
 
     let res;
     try {
-      res = await fetch(url.toString(), { method: "GET", redirect: "follow" });
+      res = await fetch(url.toString(), { method: "GET", redirect: "follow", cache: "no-store" });
     } catch (e) {
       throw new Error("เชื่อมต่อ Apps Script ไม่สำเร็จ (เครือข่าย/CORS) กรุณาตรวจสอบ URL และการ Deploy");
     }
@@ -97,6 +100,12 @@
     },
     saveStatusOptions(requestUser, optionsPipeJoined) {
       return apiRequest("saveStatusOptions", { requestUser, options: optionsPipeJoined || "" });
+    },
+    getAppConfig() {
+      return apiRequest("appConfig", {});
+    },
+    saveAppConfig(requestUser, key, valueObj) {
+      return apiRequest("saveAppConfig", { requestUser, key, value: JSON.stringify(valueObj) });
     },
   };
 })();
