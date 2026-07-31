@@ -785,18 +785,19 @@ function renderInsightHub(filteredData, rawData) {
         background-color: #fafafa;
       }
 
-      /* Freeze panes: header row (already sticky top above) + first two columns */
+            /* Freeze panes: header row (already sticky top above) + first two columns */
       .customer-table th:nth-child(1),
       .customer-table th:nth-child(2) {
         z-index: 4;
+        /* หัวคอลัมน์ไม่บังคับ max-width/overflow:hidden เหมือน td ด้านล่าง
+           เพราะทำให้ปุ่มตัวกรอง (excel-filter-btn) ที่อยู่ท้ายป้ายชื่อคอลัมน์ถูกตัด/ซ่อนไปเวลาชื่อคอลัมน์ยาว */
+        white-space: nowrap;
       }
-      .customer-table th:nth-child(1),
       .customer-table td:nth-child(1) {
         /* [ปิดชั่วคราว] position: sticky; left: 0; ทำให้คอลัมน์ CustomerKey (Phone) เลื่อนตามตอนสกอลล์แนวนอน แต่ยังมีบัคอยู่ */
         width: 130px;
         max-width: 130px;
       }
-      .customer-table th:nth-child(2),
       .customer-table td:nth-child(2) {
         /* [ปิดชั่วคราว] position: sticky; left: 130px; (freeze คู่กับคอลัมน์ที่ 1 ด้านบน — ปิดพร้อมกันกันภาพซ้อนเพี้ยน) */
         width: 170px;
@@ -804,7 +805,7 @@ function renderInsightHub(filteredData, rawData) {
         overflow: hidden;
         text-overflow: ellipsis;
         box-shadow: 2px 0 4px -2px rgba(0,0,0,0.15);
-      }
+        }
       .customer-table td:nth-child(1),
       .customer-table td:nth-child(2) {
         z-index: 2;
