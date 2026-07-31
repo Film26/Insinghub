@@ -772,8 +772,7 @@ function renderInsightHub(filteredData, rawData) {
         background-color: #fafafa;
         color: #444;
         user-select: none;
-        position: sticky;
-        top: 0;
+        /* [ปิดชั่วคราว] position: sticky; top: 0; ทำให้หัวตาราง (รวมปุ่มตัวกรอง) เลื่อนตามตอนสกอลล์ แต่ยังมีบัคอยู่ */
         z-index: 3;
       }
       .customer-table td {
